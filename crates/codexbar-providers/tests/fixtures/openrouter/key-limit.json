@@ -1,0 +1,16 @@
+{
+  "data": {
+    "label": "sk-or-v1-0123456789abcdef",
+    "limit": 50.0,
+    "limit_remaining": 12.5,
+    "limit_reset": "monthly",
+    "usage": 37.5,
+    "usage_daily": 1.25,
+    "usage_weekly": 9.5,
+    "usage_monthly": 37.5,
+    "rate_limit": {
+      "requests": 1000,
+      "interval": "1h"
+    }
+  }
+}

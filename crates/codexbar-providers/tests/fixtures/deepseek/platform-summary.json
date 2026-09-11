@@ -1,0 +1,24 @@
+{
+  "code": 0,
+  "data": {
+    "biz_code": 0,
+    "biz_data": {
+      "normal_wallets": [
+        {
+          "balance": 15.0,
+          "currency": "USD"
+        }
+      ],
+      "bonus_wallets": [
+        {
+          "balance": 3.4,
+          "currency": "USD"
+        },
+        {
+          "balance": 1.0,
+          "currency": "CNY"
+        }
+      ]
+    }
+  }
+}

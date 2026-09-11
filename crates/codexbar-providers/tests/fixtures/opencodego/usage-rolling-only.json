@@ -1,0 +1,5 @@
+{
+  "usage": {
+    "rolling": { "usagePercent": 12.5, "resetInSec": 900 }
+  }
+}

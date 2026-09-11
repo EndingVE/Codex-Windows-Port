@@ -1,0 +1,11 @@
+{
+  "currentTier": {
+    "id": "standard-tier",
+    "name": "Code Assist Standard"
+  },
+  "paidTier": {
+    "id": "standard-tier",
+    "name": "Code Assist Standard"
+  },
+  "cloudaicompanionProject": "gen-lang-client-0123456789"
+}

@@ -1,0 +1,8 @@
+{
+  "access_token": "ya29.a0AfH6SMfakeAccessTokenValue1234567890",
+  "refresh_token": "1//0fakeRefreshTokenValue1234567890",
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJzdWIiOiIxMjM0NTY3ODkwIn0.sig",
+  "scope": "openid https://www.googleapis.com/auth/cloud-platform",
+  "token_type": "Bearer",
+  "expiry_date": 1893456000000
+}

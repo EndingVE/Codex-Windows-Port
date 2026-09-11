@@ -1,0 +1,11 @@
+{
+  "data": {
+    "label": "sk-or-v1-0123456789abcdef",
+    "limit": null,
+    "limit_reset": null,
+    "limit_remaining": null,
+    "total_credits": 100.0,
+    "total_usage": 37.5,
+    "usage": 37.5
+  }
+}

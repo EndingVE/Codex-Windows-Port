@@ -1,0 +1,10 @@
+{
+  "account": {
+    "uuid": "00000000-fixture-account-uuid",
+    "emailAddress": "user@example.com"
+  },
+  "organization": {
+    "uuid": "00000000-fixture-organization-uuid",
+    "organization_type": "claude_max"
+  }
+}

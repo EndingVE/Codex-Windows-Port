@@ -1,0 +1,5 @@
+{
+  "error": "slow_down",
+  "error_description": "Please slow down your polling.",
+  "interval": 10
+}

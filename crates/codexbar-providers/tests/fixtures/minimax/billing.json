@@ -1,0 +1,22 @@
+{
+  "base_resp": { "status_code": 0 },
+  "total_cnt": 2,
+  "charge_records": [
+    {
+      "result": "SUCCESS",
+      "created_at": 1789070400000,
+      "consume_token": 1000,
+      "consume_cash_after_voucher": 1.5,
+      "model": "MiniMax-M2",
+      "method": "api"
+    },
+    {
+      "status": "SUCCESS",
+      "ymd": "2026-09-09",
+      "consume_input_token": 500,
+      "consume_output_token": 300,
+      "model": "MiniMax-M1",
+      "method": "chat"
+    }
+  ]
+}

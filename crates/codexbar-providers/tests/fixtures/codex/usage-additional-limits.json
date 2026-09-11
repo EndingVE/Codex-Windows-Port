@@ -1,0 +1,47 @@
+{
+  "plan_type": "pro",
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 10,
+      "reset_at": 1790000000,
+      "limit_window_seconds": 18000
+    }
+  },
+  "additional_rate_limits": [
+    {
+      "limit_name": "GPT-5.3-Codex-Spark",
+      "metered_feature": "codex-spark",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": 5,
+          "reset_at": 1790000000,
+          "limit_window_seconds": 18000
+        },
+        "secondary_window": {
+          "used_percent": 2,
+          "reset_at": 1790500000,
+          "limit_window_seconds": 604800
+        }
+      }
+    },
+    {
+      "limit_name": "Code Reviews",
+      "metered_feature": "code_review",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": 30,
+          "reset_at": 1790000000,
+          "limit_window_seconds": 18000
+        }
+      }
+    },
+    {
+      "limit_name": "Broken",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": "oops"
+        }
+      }
+    }
+  ]
+}

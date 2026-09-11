@@ -1,0 +1,21 @@
+{
+  "usage": {
+    "limit": "2048",
+    "used": "214",
+    "remaining": "1834",
+    "resetTime": "2026-09-17T15:23:13.716Z"
+  },
+  "limits": [
+    {
+      "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+      "detail": {
+        "limit": "200",
+        "used": "139",
+        "remaining": "61",
+        "resetTime": "2026-09-10T21:33:02.717Z"
+      }
+    }
+  ],
+  "user": { "membership": { "level": "LEVEL_BASIC" } },
+  "version": "GOODS_VERSION_V1"
+}

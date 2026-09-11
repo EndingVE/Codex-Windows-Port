@@ -1,0 +1,11 @@
+{
+  "tier": "creator",
+  "character_count": 25000,
+  "character_limit": 100000,
+  "voice_slots_used": 3,
+  "voice_limit": 10,
+  "professional_voice_slots_used": 1,
+  "professional_voice_limit": 5,
+  "status": "active",
+  "next_character_count_reset_unix": 1780000000
+}

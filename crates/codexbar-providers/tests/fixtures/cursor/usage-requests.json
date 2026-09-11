@@ -1,0 +1,10 @@
+{
+  "gpt-4": {
+    "numRequests": 118,
+    "numRequestsTotal": 120,
+    "numTokens": 900000,
+    "maxRequestUsage": 500,
+    "maxTokenUsage": 5000000
+  },
+  "startOfMonth": "2026-09-01T00:00:00.000Z"
+}

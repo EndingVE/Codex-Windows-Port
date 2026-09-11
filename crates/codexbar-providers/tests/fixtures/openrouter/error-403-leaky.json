@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "This request is not authorized: key sk-or-v1-0123456789abcdefghijklmnop is disabled",
+    "code": 403
+  }
+}

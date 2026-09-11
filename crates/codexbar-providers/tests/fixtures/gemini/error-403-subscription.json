@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 403,
+    "message": "SUBSCRIPTION_REQUIRED",
+    "status": "PERMISSION_DENIED"
+  }
+}

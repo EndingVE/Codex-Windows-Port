@@ -1,0 +1,23 @@
+[package]
+name = "codexbar-win"
+description = "CodexBar for Windows — tray app showing AI provider usage limits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "codexbar-win"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+codexbar-core = { workspace = true }
+codexbar-providers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }

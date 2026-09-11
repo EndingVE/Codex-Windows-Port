@@ -1,0 +1,8 @@
+{
+  "data": {
+    "session_jwt": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIiwiaHR0cHM6Ly9ncm9xLmNvbS9vcmdhbml6YXRpb24iOnsiaWQiOiJvcmdfdGVzdDEyMyIsInNsdWciOiJhY21lIn0sImlhdCI6MTc1NzUwMDAwMH0.c2lnbmF0dXJlLW5vdC12ZXJpZmllZA",
+    "session": {
+      "expires_at": "2026-10-10T00:00:00Z"
+    }
+  }
+}

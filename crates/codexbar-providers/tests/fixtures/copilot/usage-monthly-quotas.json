@@ -1,0 +1,6 @@
+{
+  "copilot_plan": "business",
+  "token_based_billing": false,
+  "monthly_quotas": { "chat": 500, "completions": 300 },
+  "limited_user_quotas": { "chat": 400, "completions": 150 }
+}

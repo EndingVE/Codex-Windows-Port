@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "unauthorized_unknown",
+    "message": "Could not parse your authentication token. Please try signing in again."
+  },
+  "status": 401
+}

@@ -1,0 +1,22 @@
+{
+  "copilot_plan": "individual",
+  "token_based_billing": false,
+  "quota_reset_date": "2026-10-01T00:00:00.000Z",
+  "quota_snapshots": {
+    "premium_interactions": {
+      "quota_id": "premium_interactions",
+      "entitlement": 300,
+      "remaining": 210,
+      "percent_remaining": 70,
+      "credits_used": 90,
+      "unlimited": false
+    },
+    "chat": {
+      "quota_id": "chat",
+      "entitlement": 1000,
+      "remaining": 1000,
+      "percent_remaining": 100,
+      "unlimited": false
+    }
+  }
+}

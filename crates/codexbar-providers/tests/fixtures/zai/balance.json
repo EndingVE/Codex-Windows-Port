@@ -1,0 +1,10 @@
+{
+  "success": true,
+  "data": {
+    "availableBalance": 1234.56,
+    "balance": 1200.0,
+    "rechargeAmount": 2000.0,
+    "giveAmount": 0.0,
+    "totalSpendAmount": 765.44
+  }
+}

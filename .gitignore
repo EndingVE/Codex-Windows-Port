@@ -1,0 +1,20 @@
+# Rust build output
+/target
+/.cargo-target
+**/target/
+
+# Evidence artifacts (build screenshots / reports). Kept out of the public repo:
+# only source and specs are published — see README "Screenshot".
+/evidence/
+
+# Distribution / packaging
+/dist/
+*.zip
+
+# Node
+node_modules/
+
+# Scratch / local
+*.bak
+*.tmp
+*.log

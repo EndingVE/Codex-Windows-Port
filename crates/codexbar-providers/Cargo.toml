@@ -1,0 +1,25 @@
+[package]
+name = "codexbar-providers"
+description = "Real provider implementations + shared HTTP / credential / OAuth helpers for the CodexBar Windows port."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+codexbar-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+# Read-only SQLite access for local provider stores (OpenCode Go's `opencode.db`).
+# `bundled` compiles SQLite from source so the port has no system-wide dependency
+# and the version is pinned in Cargo.lock.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# Integration tests build a throwaway fixture database in a temp dir; the crate
+# itself only ever opens databases read-only.
+rusqlite = { version = "0.32", features = ["bundled"] }
+

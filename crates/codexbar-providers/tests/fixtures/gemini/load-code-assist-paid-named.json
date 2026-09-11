@@ -1,0 +1,9 @@
+{
+  "paidTier": {
+    "id": "standard-tier",
+    "name": "Google One AI Premium"
+  },
+  "cloudaicompanionProject": {
+    "id": "gen-lang-client-9999999999"
+  }
+}

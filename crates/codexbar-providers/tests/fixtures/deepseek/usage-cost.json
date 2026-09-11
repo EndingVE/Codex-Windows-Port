@@ -1,0 +1,54 @@
+{
+  "code": 0,
+  "data": {
+    "biz_code": 0,
+    "biz_data": [
+      {
+        "currency": "USD",
+        "total": [
+          {
+            "model": "deepseek-chat",
+            "usage": [
+              {
+                "type": "PROMPT_CACHE_HIT_TOKEN",
+                "amount": "0.0200"
+              },
+              {
+                "type": "PROMPT_CACHE_MISS_TOKEN",
+                "amount": "0.3500"
+              },
+              {
+                "type": "RESPONSE_TOKEN",
+                "amount": "0.3100"
+              }
+            ]
+          }
+        ],
+        "days": [
+          {
+            "date": "2026-09-10",
+            "data": [
+              {
+                "model": "deepseek-chat",
+                "usage": [
+                  {
+                    "type": "PROMPT_CACHE_HIT_TOKEN",
+                    "amount": "0.0020"
+                  },
+                  {
+                    "type": "PROMPT_CACHE_MISS_TOKEN",
+                    "amount": "0.0300"
+                  },
+                  {
+                    "type": "RESPONSE_TOKEN",
+                    "amount": "0.0200"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

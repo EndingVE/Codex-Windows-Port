@@ -1,0 +1,27 @@
+{
+  "billingCycleStart": "2026-09-01T00:00:00.000Z",
+  "billingCycleEnd": "2026-10-01T00:00:00.000Z",
+  "membershipType": "hobby",
+  "individualUsage": {
+    "plan": {
+      "enabled": true,
+      "used": 250,
+      "limit": 1000,
+      "remaining": 750
+    }
+  },
+  "teamUsage": {
+    "onDemand": {
+      "enabled": true,
+      "used": 500,
+      "limit": 2000,
+      "remaining": 1500
+    },
+    "pooled": {
+      "enabled": true,
+      "used": 3000,
+      "limit": 10000,
+      "remaining": 7000
+    }
+  }
+}

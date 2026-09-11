@@ -1,0 +1,31 @@
+{
+  "success": true,
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "planName": "Coding Plan Pro",
+    "limits": [
+      {
+        "type": "TOKENS_LIMIT",
+        "unit": 3,
+        "number": 5,
+        "percentage": 12,
+        "nextResetTime": 1789077600000
+      },
+      {
+        "type": "TOKENS_LIMIT",
+        "unit": 6,
+        "number": 1,
+        "percentage": 40,
+        "nextResetTime": 1789516800000
+      },
+      {
+        "type": "TIME_LIMIT",
+        "unit": 5,
+        "number": 1,
+        "percentage": 5,
+        "usageDetails": []
+      }
+    ]
+  }
+}

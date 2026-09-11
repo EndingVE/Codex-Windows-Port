@@ -1,0 +1,5 @@
+{
+  "access_token": "gho_device_flow_fixture_token",
+  "token_type": "bearer",
+  "scope": "read:user"
+}

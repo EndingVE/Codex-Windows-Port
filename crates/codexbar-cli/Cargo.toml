@@ -1,0 +1,20 @@
+[package]
+name = "codexbar-cli"
+description = "Terminal entry point for the CodexBar Windows port (mock mode today, real providers later)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "codexbar"
+path = "src/main.rs"
+
+[dependencies]
+codexbar-core = { workspace = true }
+codexbar-providers = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }

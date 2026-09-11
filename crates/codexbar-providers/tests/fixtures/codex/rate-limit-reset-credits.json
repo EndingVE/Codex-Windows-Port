@@ -1,0 +1,11 @@
+{
+  "available_count": 2,
+  "credits": [
+    {
+      "id": "rc-1",
+      "reset_type": "weekly",
+      "status": "available",
+      "granted_at": "2026-09-01T00:00:00Z"
+    }
+  ]
+}

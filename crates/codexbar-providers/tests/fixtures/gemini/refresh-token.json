@@ -1,0 +1,7 @@
+{
+  "access_token": "ya29.FRESHlyRefreshedAccessToken0987654321",
+  "expires_in": 3600,
+  "scope": "https://www.googleapis.com/auth/cloud-platform",
+  "token_type": "Bearer",
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJzdWIiOiIxMjM0NTY3ODkwIn0.sig"
+}

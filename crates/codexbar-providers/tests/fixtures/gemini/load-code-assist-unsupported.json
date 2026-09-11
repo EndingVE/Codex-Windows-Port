@@ -1,0 +1,9 @@
+{
+  "ineligibleTiers": [
+    {
+      "tierId": "free-tier",
+      "reasonCode": "UNSUPPORTED_CLIENT",
+      "reasonMessage": "Gemini Code Assist is no longer supported for this account. Migrate to Antigravity."
+    }
+  ]
+}

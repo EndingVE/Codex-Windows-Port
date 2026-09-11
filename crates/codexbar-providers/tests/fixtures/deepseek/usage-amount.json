@@ -1,0 +1,59 @@
+{
+  "code": 0,
+  "data": {
+    "biz_code": 0,
+    "biz_data": {
+      "total": [
+        {
+          "model": "deepseek-chat",
+          "usage": [
+            {
+              "type": "PROMPT_CACHE_HIT_TOKEN",
+              "amount": "2000"
+            },
+            {
+              "type": "PROMPT_CACHE_MISS_TOKEN",
+              "amount": "5000"
+            },
+            {
+              "type": "RESPONSE_TOKEN",
+              "amount": "3000"
+            },
+            {
+              "type": "REQUEST",
+              "amount": "90"
+            }
+          ]
+        }
+      ],
+      "days": [
+        {
+          "date": "2026-09-10",
+          "data": [
+            {
+              "model": "deepseek-chat",
+              "usage": [
+                {
+                  "type": "PROMPT_CACHE_HIT_TOKEN",
+                  "amount": "500"
+                },
+                {
+                  "type": "PROMPT_CACHE_MISS_TOKEN",
+                  "amount": "1000"
+                },
+                {
+                  "type": "RESPONSE_TOKEN",
+                  "amount": "700"
+                },
+                {
+                  "type": "REQUEST",
+                  "amount": "12"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "planName": "Coding Plan Lite",
+    "limits": [
+      {
+        "type": "TOKENS_LIMIT",
+        "unit": 3,
+        "number": 5,
+        "percentage": 1,
+        "usage": 1000,
+        "currentValue": 250,
+        "remaining": 700,
+        "nextResetTime": 1789077600000
+      }
+    ]
+  }
+}

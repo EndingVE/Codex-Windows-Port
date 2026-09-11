@@ -1,0 +1,4 @@
+{
+  "error": "forbidden",
+  "message": "The Management API key is not permitted to read this team"
+}

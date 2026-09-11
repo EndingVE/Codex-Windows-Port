@@ -1,0 +1,5 @@
+{
+  "error": {
+    "message": "This request is not authorized: key sk-opencode-leak-0123456789abcdef is disabled"
+  }
+}
