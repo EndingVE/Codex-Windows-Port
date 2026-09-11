@@ -62,7 +62,7 @@
           </svg>
         </span>
         <span class="cmd-label">Refresh</span>
-        <span class="cmd-key">Ctrl R</span>
+        <span class="cmd-key" data-shortcut="R">Ctrl R</span>
       </button>
       <button class="cmd" id="cmdSettings" type="button">
         <span class="cmd-icon" aria-hidden="true">
@@ -73,7 +73,7 @@
           </svg>
         </span>
         <span class="cmd-label">Settings…</span>
-        <span class="cmd-key">Ctrl ,</span>
+        <span class="cmd-key" data-shortcut=",">Ctrl ,</span>
       </button>
       <button class="cmd" id="cmdAbout" type="button">
         <span class="cmd-icon" aria-hidden="true">
@@ -94,7 +94,7 @@
           </svg>
         </span>
         <span class="cmd-label">Quit</span>
-        <span class="cmd-key">Ctrl Q</span>
+        <span class="cmd-key" data-shortcut="Q">Ctrl Q</span>
       </button>
     </nav>
 
@@ -106,6 +106,7 @@
 
   <div class="toast" id="toast" role="status" hidden></div>
 
+  <script src="platform.js"></script>
   <script src="mock.js"></script>
   <script src="format.js"></script>
   <script src="render.js"></script>

@@ -98,6 +98,10 @@ flyout, right-click for the menu (*Refresh now*, *Settings…*, *Quit*). The ico
 donut arc tracks the provider closest to its limit. `codexbar-win.exe --show`
 opens the popover immediately.
 
+**Keyboard shortcuts** (Windows modifiers — the popover footer lists them):
+<kbd>Ctrl</kbd>+<kbd>R</kbd> refresh, <kbd>Ctrl</kbd>+<kbd>,</kbd> settings,
+<kbd>Ctrl</kbd>+<kbd>Q</kbd> quit, <kbd>Esc</kbd> close.
+
 **Use the CLI.**
 
 ```
@@ -183,6 +187,20 @@ a provider returns. `CONTRACT.md` documents the contract in full.
 
 All captures come from the built-in **mock fixture** — sample data, no
 credentials read, no network calls, no real accounts.
+
+Regenerate them headlessly (Edge `--headless=new`, the Tauri window is never
+launched) with:
+
+```bash
+node scripts/render-docs-images.mjs          # writes docs/images/
+node scripts/render-docs-images.mjs --check  # verify shortcuts, write nothing
+```
+
+The shortcut labels come from `ui/platform.js`, which resolves the platform from
+an **explicit `?platform=` override** rather than sniffing the browser, so a
+capture can never depend on the host it was taken on: `?platform=windows` (the
+default, and what the script pins) renders `Ctrl R` / `Ctrl ,` / `Ctrl Q`;
+`?platform=mac` is an opt-in purely for diffing against the original macOS app.
 
 ## Security & privacy
 
