@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CodexBar Settings</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- Blocking on purpose: paints the saved theme before the first frame. -->
+  <script src="theme.js"></script>
 </head>
 <body class="settings-page">
   <div class="settings">
@@ -43,6 +45,15 @@
           </svg>
         </span>
         <span class="nav-label">Display</span>
+      </button>
+      <button class="nav-item" type="button" data-pane="appearance">
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="14" height="14">
+            <circle cx="8" cy="8" r="5.8" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M8 2.2a5.8 5.8 0 0 1 0 11.6Z" fill="currentColor"/>
+          </svg>
+        </span>
+        <span class="nav-label">Appearance</span>
       </button>
       <button class="nav-item" type="button" data-pane="advanced">
         <span class="nav-icon" aria-hidden="true">
@@ -194,17 +205,138 @@
                         aria-label="Draw the used percentage into the icon"></button>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- --------------------------------------------- Appearance -->
+      <section class="pane" id="pane-appearance" role="tabpanel">
+        <h2>Appearance</h2>
+        <p class="pane-sub">Theme, accent and sizing for the popover, this window and the widget.</p>
+
+        <div class="group">
+          <h3>Theme</h3>
+          <div class="setting-card">
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Colour theme</div>
+                <div class="desc">System follows the Windows app theme (<code>prefers-color-scheme</code>) and
+                  switches live.</div>
+              </div>
+              <div class="control">
+                <div class="segmented" id="ap-theme" role="radiogroup" aria-label="Colour theme">
+                  <button type="button" role="radio" data-value="system" aria-checked="true">System</button>
+                  <button type="button" role="radio" data-value="light" aria-checked="false">Light</button>
+                  <button type="button" role="radio" data-value="dark" aria-checked="false">Dark</button>
+                </div>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Accent colour</div>
+                <div class="desc">Buttons, switches, focus rings and the tray mark. Text on the accent is
+                  picked automatically to keep at least 4.5:1 contrast.
+                  <span class="contrast-note" id="ap-contrast">—</span></div>
+              </div>
+              <div class="control accent-control">
+                <div class="swatches" id="ap-swatches" role="radiogroup" aria-label="Accent presets"></div>
+                <input class="color-input" type="color" id="ap-accent-picker" value="#6ea8fe"
+                       aria-label="Custom accent colour" />
+                <input class="select hex-input" type="text" id="ap-accent-hex" value="#6ea8fe" maxlength="7"
+                       spellcheck="false" aria-label="Accent colour hex" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="group">
+          <h3>Size and spacing</h3>
+          <div class="setting-card">
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Text and UI scale</div>
+                <div class="desc">90 – 130 %.</div>
+              </div>
+              <div class="control">
+                <input class="range" type="range" id="ap-font-scale" min="90" max="130" step="5" value="100"
+                       aria-label="Text and UI scale" />
+                <output class="range-out" id="ap-font-scale-out" for="ap-font-scale">100%</output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Density</div>
+                <div class="desc">Compact tightens card and row spacing.</div>
+              </div>
+              <div class="control">
+                <div class="segmented" id="ap-density" role="radiogroup" aria-label="Density">
+                  <button type="button" role="radio" data-value="compact" aria-checked="false">Compact</button>
+                  <button type="button" role="radio" data-value="normal" aria-checked="true">Normal</button>
+                </div>
+              </div>
+            </div>
             <div class="setting-row">
               <div class="text">
                 <div class="label">Show the colour legend</div>
                 <div class="desc">A one-line key above the command list explaining the green / amber / red
-                  severity thresholds. Stored with the UI, not the provider config.</div>
+                  severity thresholds.</div>
               </div>
               <div class="control">
-                <button class="switch" role="switch" aria-checked="true" id="set-showLegend"
+                <button class="switch" role="switch" aria-checked="true" id="ap-showLegend"
                         aria-label="Show the colour legend"></button>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="group">
+          <h3>Transparency</h3>
+          <div class="setting-card">
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Popover opacity</div>
+                <div class="desc">60 – 100 %. Takes effect on transparent windows.</div>
+              </div>
+              <div class="control">
+                <input class="range" type="range" id="ap-popover-opacity" min="60" max="100" step="5" value="100"
+                       aria-label="Popover opacity" />
+                <output class="range-out" id="ap-popover-opacity-out" for="ap-popover-opacity">100%</output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Widget opacity</div>
+                <div class="desc">60 – 100 %, for the floating widget.</div>
+              </div>
+              <div class="control">
+                <input class="range" type="range" id="ap-widget-opacity" min="60" max="100" step="5" value="100"
+                       aria-label="Widget opacity" />
+                <output class="range-out" id="ap-widget-opacity-out" for="ap-widget-opacity">100%</output>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="group">
+          <h3>Preview</h3>
+          <div class="setting-card appearance-preview">
+            <div class="setting-row">
+              <div class="text">
+                <div class="label">Codex · Session</div>
+                <div class="preview-bar" aria-hidden="true"><span></span></div>
+                <div class="desc">58% used · resets in 2h 14m</div>
+              </div>
+              <div class="control">
+                <button class="btn" type="button" tabindex="-1">Secondary</button>
+                <button class="btn primary" type="button" tabindex="-1">Primary</button>
+                <span class="switch" role="presentation" aria-checked="true"></span>
+              </div>
+            </div>
+          </div>
+          <div class="settings-foot">
+            <span class="hint">Saved to <code>%APPDATA%\CodexBar\appearance.json</code>.</span>
+            <span class="spacer"></span>
+            <button class="btn" id="ap-reset" type="button">Reset</button>
           </div>
         </div>
       </section>
@@ -288,5 +420,6 @@
   <script src="platform.js"></script>
   <script src="format.js"></script>
   <script src="settings.js"></script>
+  <script src="appearance.js"></script>
 </body>
 </html>

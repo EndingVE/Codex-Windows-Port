@@ -26,14 +26,72 @@ pub const fn severity_rgb(used_percent: f64) -> [u8; 4] {
     }
 }
 
-/// Track colour drawn behind the arc, the same for every severity.
-const TRACK: [u8; 4] = [58, 63, 74, 255];
-/// Hub fill so the mark stays legible in a 16 px tray.
-const HUB: [u8; 4] = [30, 33, 40, 255];
-/// Digit colour.
-const INK: [u8; 4] = [245, 247, 250, 255];
-/// Neutral accent for "no data" icons.
-const UNKNOWN_ACCENT: [u8; 4] = [120, 128, 140, 255];
+/// Non-severity colours of the tray mark. Severity (the arc) is semantic and
+/// never themed; everything around it follows the user's appearance
+/// (`src-tauri/src/appearance.rs`): the light/dark base and the accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayPalette {
+    /// Track drawn behind the arc, the same for every severity.
+    pub track: [u8; 4],
+    /// Hub fill so the mark stays legible in a 16 px tray.
+    pub hub: [u8; 4],
+    /// Digit colour.
+    pub ink: [u8; 4],
+    /// Ring of the "no data" icon.
+    pub unknown: [u8; 4],
+    /// Centre dot of the gauge-only icon.
+    pub center: [u8; 4],
+}
+
+impl TrayPalette {
+    /// Dark taskbar — the historical colours.
+    pub const DARK: Self = Self {
+        track: [58, 63, 74, 255],
+        hub: [30, 33, 40, 255],
+        ink: [245, 247, 250, 255],
+        unknown: [120, 128, 140, 255],
+        center: [255, 255, 255, 255],
+    };
+    /// Light taskbar: pale hub, dark digits (≥ 12:1), mid-grey track.
+    pub const LIGHT: Self = Self {
+        track: [196, 201, 210, 255],
+        hub: [246, 247, 249, 255],
+        ink: [22, 25, 31, 255],
+        unknown: [120, 128, 140, 255],
+        center: [22, 25, 31, 255],
+    };
+
+    /// Tint the accent-bearing parts (gauge centre dot, "no data" ring).
+    pub const fn with_accent(self, rgb: [u8; 3]) -> Self {
+        let accent = [rgb[0], rgb[1], rgb[2], 255];
+        Self {
+            unknown: accent,
+            center: accent,
+            ..self
+        }
+    }
+}
+
+static PALETTE: std::sync::RwLock<TrayPalette> = std::sync::RwLock::new(TrayPalette::DARK);
+
+/// Install the palette every subsequent tray icon is drawn with.
+pub fn set_palette(palette: TrayPalette) {
+    match PALETTE.write() {
+        Ok(mut guard) => *guard = palette,
+        Err(poisoned) => *poisoned.into_inner() = palette,
+    }
+}
+
+/// Palette currently in force.
+pub fn palette() -> TrayPalette {
+    match PALETTE.read() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+const INK: [u8; 4] = TrayPalette::DARK.ink;
 
 /// 3×5 bitmap glyphs. Each `u8` is one row, bit 2 = leftmost pixel.
 fn glyph(ch: char) -> Option<[u8; 5]> {
@@ -113,10 +171,16 @@ fn draw_centered_text(out: &mut [u8], size: u32, text: &str, scale: u32, color: 
     }
 }
 
+#[cfg(test)]
 /// Draw a donut gauge. `used_percent` is `0..=100` (values outside are clamped).
 ///
 /// Returns tightly packed RGBA bytes, row-major, `size * size * 4` long.
 pub fn gauge_rgba(size: u32, used_percent: f64) -> Vec<u8> {
+    gauge_rgba_with(size, used_percent, &palette())
+}
+
+/// [`gauge_rgba`] with an explicit palette.
+pub fn gauge_rgba_with(size: u32, used_percent: f64, pal: &TrayPalette) -> Vec<u8> {
     let size = size.max(8);
     let accent = severity_rgb(used_percent);
     let fraction = (used_percent / 100.0).clamp(0.0, 1.0);
@@ -137,16 +201,16 @@ pub fn gauge_rgba(size: u32, used_percent: f64) -> Vec<u8> {
             let pixel: Option<[u8; 4]> = if dist > outer {
                 None
             } else if dist < hub_r {
-                Some([255, 255, 255, 255])
+                Some(pal.center)
             } else if dist < inner {
-                Some(HUB)
+                Some(pal.hub)
             } else {
                 // atan2 gives -180..180 with 0 = 3 o'clock; shift so 0 = 12 o'clock.
                 let angle = (dy.atan2(dx).to_degrees() + 450.0) % 360.0;
                 if angle <= sweep {
                     Some(accent)
                 } else {
-                    Some(TRACK)
+                    Some(pal.track)
                 }
             };
 
@@ -159,6 +223,7 @@ pub fn gauge_rgba(size: u32, used_percent: f64) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 /// Ring + the used percentage drawn in the middle.
 ///
 /// Geometry is a solid disc (so the digits always have contrast) with a thicker
@@ -166,6 +231,11 @@ pub fn gauge_rgba(size: u32, used_percent: f64) -> Vec<u8> {
 /// `size = 32` that leaves a ~22 px hole, which fits `42` at scale 3, `7` at
 /// scale 4 and `100` at scale 2.
 pub fn percent_rgba(size: u32, used_percent: f64) -> Vec<u8> {
+    percent_rgba_with(size, used_percent, &palette())
+}
+
+/// [`percent_rgba`] with an explicit palette.
+pub fn percent_rgba_with(size: u32, used_percent: f64, pal: &TrayPalette) -> Vec<u8> {
     let size = size.max(16);
     let accent = severity_rgb(used_percent);
     let fraction = (used_percent / 100.0).clamp(0.0, 1.0);
@@ -190,10 +260,10 @@ pub fn percent_rgba(size: u32, used_percent: f64) -> Vec<u8> {
                 if angle <= sweep {
                     accent
                 } else {
-                    TRACK
+                    pal.track
                 }
             } else {
-                HUB
+                pal.hub
             };
             let idx = ((y * size + x) * 4) as usize;
             out[idx..idx + 4].copy_from_slice(&pixel);
@@ -202,14 +272,20 @@ pub fn percent_rgba(size: u32, used_percent: f64) -> Vec<u8> {
 
     let text = format!("{}", used_percent.clamp(0.0, 100.0).round() as i64);
     let scale = fit_scale(text.chars().count(), (inner * 2.0).ceil() as u32);
-    draw_centered_text(&mut out, size, &text, scale, INK);
+    draw_centered_text(&mut out, size, &text, scale, pal.ink);
     out
 }
 
+#[cfg(test)]
 /// Icon for a provider with no usable number: neutral ring with a dash.
 pub fn unknown_rgba(size: u32) -> Vec<u8> {
+    unknown_rgba_with(size, &palette())
+}
+
+/// [`unknown_rgba`] with an explicit palette.
+pub fn unknown_rgba_with(size: u32, pal: &TrayPalette) -> Vec<u8> {
     let size = size.max(16);
-    let mut out = percent_rgba(size, 0.0);
+    let mut out = percent_rgba_with(size, 0.0, pal);
     // Replace the "0" with a dash: repaint the hole, then stamp the glyph.
     let center = (size as f32 - 1.0) / 2.0;
     let outer = size as f32 * 0.5 - size as f32 * 0.045;
@@ -223,7 +299,7 @@ pub fn unknown_rgba(size: u32) -> Vec<u8> {
                 continue;
             }
             let idx = ((y * size + x) * 4) as usize;
-            out[idx..idx + 4].copy_from_slice(&HUB);
+            out[idx..idx + 4].copy_from_slice(&pal.hub);
         }
     }
     // Grey, short sweep: "we have no idea".
@@ -238,12 +314,12 @@ pub fn unknown_rgba(size: u32) -> Vec<u8> {
             let angle = (dy.atan2(dx).to_degrees() + 450.0) % 360.0;
             if angle > 60.0 {
                 let idx = ((y * size + x) * 4) as usize;
-                out[idx..idx + 4].copy_from_slice(&UNKNOWN_ACCENT);
+                out[idx..idx + 4].copy_from_slice(&pal.unknown);
             }
         }
     }
     let scale = fit_scale(1, (inner * 2.0).ceil() as u32);
-    draw_centered_text(&mut out, size, "-", scale, INK);
+    draw_centered_text(&mut out, size, "-", scale, pal.ink);
     out
 }
 
@@ -252,10 +328,20 @@ pub fn unknown_rgba(size: u32) -> Vec<u8> {
 /// `percent = None` means the provider has no usable number (not configured,
 /// error, or only synthetic placeholder lanes).
 pub fn icon_rgba(size: u32, percent: Option<f64>, show_percent: bool) -> Vec<u8> {
+    icon_rgba_with(size, percent, show_percent, &palette())
+}
+
+/// [`icon_rgba`] with an explicit palette (evidence dumps, tests).
+pub fn icon_rgba_with(
+    size: u32,
+    percent: Option<f64>,
+    show_percent: bool,
+    pal: &TrayPalette,
+) -> Vec<u8> {
     match (percent, show_percent) {
-        (None, _) => unknown_rgba(size),
-        (Some(pct), true) => percent_rgba(size, pct),
-        (Some(pct), false) => gauge_rgba(size, pct),
+        (None, _) => unknown_rgba_with(size, pal),
+        (Some(pct), true) => percent_rgba_with(size, pct, pal),
+        (Some(pct), false) => gauge_rgba_with(size, pct, pal),
     }
 }
 
@@ -343,5 +429,67 @@ mod tests {
     #[test]
     fn unknown_icon_is_not_the_zero_icon() {
         assert_ne!(unknown_rgba(32), percent_rgba(32, 0.0));
+    }
+
+    #[test]
+    fn dark_palette_keeps_the_historical_pixels() {
+        let dark = TrayPalette::DARK;
+        assert_eq!(dark.track, [58, 63, 74, 255]);
+        assert_eq!(dark.hub, [30, 33, 40, 255]);
+        assert_eq!(dark.ink, INK);
+        assert_eq!(
+            percent_rgba_with(32, 42.0, &dark),
+            percent_rgba_with(32, 42.0, &TrayPalette::DARK)
+        );
+    }
+
+    #[test]
+    fn light_palette_changes_hub_and_ink() {
+        let dark = percent_rgba_with(32, 42.0, &TrayPalette::DARK);
+        let light = percent_rgba_with(32, 42.0, &TrayPalette::LIGHT);
+        assert_ne!(dark, light);
+        let centre = ((16 * 32 + 16) * 4) as usize;
+        let hub_or_ink = &light[centre..centre + 4];
+        assert!(
+            hub_or_ink == TrayPalette::LIGHT.hub || hub_or_ink == TrayPalette::LIGHT.ink,
+            "centre pixel must come from the light palette"
+        );
+    }
+
+    #[test]
+    fn accent_tints_the_gauge_centre_and_unknown_ring() {
+        let pal = TrayPalette::DARK.with_accent([255, 0, 128]);
+        let gauge = gauge_rgba_with(32, 30.0, &pal);
+        let c = 16usize;
+        let idx = (c * 32 + c) * 4;
+        assert_eq!(&gauge[idx..idx + 4], &[255, 0, 128, 255]);
+        let unknown = unknown_rgba_with(32, &pal);
+        assert!(unknown.chunks(4).any(|px| px == [255, 0, 128, 255]));
+        assert!(!unknown_rgba_with(32, &TrayPalette::DARK)
+            .chunks(4)
+            .any(|px| px == [255, 0, 128, 255]));
+        // Severity (the arc) is never themed.
+        let sev = severity_rgb(30.0);
+        assert!(gauge.chunks(4).any(|px| px == sev));
+    }
+
+    #[test]
+    fn digits_contrast_with_the_hub_in_both_palettes() {
+        fn lum(c: [u8; 4]) -> f64 {
+            let ch = |v: u8| {
+                let s = v as f64 / 255.0;
+                if s <= 0.03928 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+        }
+        for pal in [TrayPalette::DARK, TrayPalette::LIGHT] {
+            let (a, b) = (lum(pal.ink), lum(pal.hub));
+            let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(ratio >= 7.0, "ink/hub contrast {ratio:.1}");
+        }
     }
 }
