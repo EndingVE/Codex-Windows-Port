@@ -24,9 +24,14 @@ anyhow = "1"
 # `rustls-tls` (not native-tls) so no OpenSSL/Schannel build dependency is needed
 # on Windows; `blocking` keeps provider `fetch()` synchronous, which is what the
 # `Provider` trait and the tray's background refresh thread expect.
+# `rustls-tls-native-roots` adds the Windows certificate store to the bundled
+# webpki roots (corporate / TLS-inspecting proxies), and `system-proxy` reads the
+# Windows (WinINET) proxy settings in addition to the *_PROXY env vars.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "rustls-tls",
+    "rustls-tls-native-roots",
+    "system-proxy",
 ] }
 
 [profile.release]

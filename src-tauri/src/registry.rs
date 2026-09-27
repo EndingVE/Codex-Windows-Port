@@ -23,6 +23,9 @@
 //! `collect()` sorts by `ProviderId::ALL`, so both modes emit the same 14
 //! providers in the same order and the popover cannot tell them apart.
 
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
 use codexbar_core::{collect, mock::MockProvider, Provider, ProviderId, UsageReport};
 
 use crate::settings::Settings;
@@ -88,6 +91,71 @@ pub fn registry_for(mode: RegistryMode) -> Vec<Box<dyn Provider>> {
     }
 }
 
+/// Shared (`Arc`) provider list for `mode`, as the parallel refresh pipeline
+/// (`codexbar_core::refresh::collect_with`) wants it.
+pub fn shared_registry_for(mode: RegistryMode) -> Vec<Arc<dyn Provider>> {
+    match mode {
+        RegistryMode::Live => codexbar_providers::live_registry_shared(),
+        RegistryMode::Mock => codexbar_core::mock_registry_shared(),
+    }
+}
+
+/// What a cached registry was built from. Providers read the environment and
+/// `config.json` when they are **constructed**, so the registry is rebuilt
+/// whenever the mode or the config file (size / mtime) changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryKey {
+    pub mode: RegistryMode,
+    pub config: Option<(SystemTime, u64)>,
+}
+
+impl RegistryKey {
+    pub fn current(mode: RegistryMode) -> Self {
+        let config = std::fs::metadata(crate::settings::config_path())
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        Self { mode, config }
+    }
+}
+
+type SharedRegistry = Arc<Vec<Arc<dyn Provider>>>;
+
+/// Registry reused across refresh ticks instead of being rebuilt (and every
+/// credential file re-parsed) on each one. [`RegistryCache::invalidate`] forces
+/// a rebuild (settings saved, manual refresh, sign-in finished).
+#[derive(Default)]
+pub struct RegistryCache {
+    slot: Mutex<Option<(RegistryKey, SharedRegistry)>>,
+}
+
+impl RegistryCache {
+    /// The registry for `mode`, rebuilt only when its [`RegistryKey`] changed.
+    pub fn get(&self, mode: RegistryMode) -> SharedRegistry {
+        self.get_with(RegistryKey::current(mode), shared_registry_for)
+    }
+
+    /// [`RegistryCache::get`] with an explicit key and builder (tests).
+    pub fn get_with(
+        &self,
+        key: RegistryKey,
+        build: impl FnOnce(RegistryMode) -> Vec<Arc<dyn Provider>>,
+    ) -> SharedRegistry {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_key, registry)) = slot.as_ref() {
+            if *cached_key == key {
+                return Arc::clone(registry);
+            }
+        }
+        let registry: SharedRegistry = Arc::new(build(key.mode));
+        *slot = Some((key, Arc::clone(&registry)));
+        registry
+    }
+
+    pub fn invalidate(&self) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 /// Fetch every provider of `mode` into one report (canonical order).
 pub fn report_for(mode: RegistryMode) -> UsageReport {
     collect(&registry_for(mode))
@@ -131,7 +199,7 @@ pub const CREDENTIAL_REFRESH_ENTRY_POINT: &str =
 /// refresh). With the setting on this build still reports
 /// `hook_available: false` and refreshes nothing, because no provider exposes
 /// the hook yet — it does not pretend to have refreshed anything.
-pub fn refresh_credentials_pass(registry: &[Box<dyn Provider>]) -> CredentialRefreshOutcome {
+pub fn refresh_credentials_pass<P>(registry: &[P]) -> CredentialRefreshOutcome {
     if registry.is_empty() {
         return CredentialRefreshOutcome::default();
     }
@@ -204,6 +272,38 @@ mod tests {
             .collect();
         assert_eq!(app, cli);
         assert_eq!(app, ProviderId::ALL.to_vec());
+    }
+
+    /// The cache hands back the same registry while the key is unchanged and
+    /// rebuilds it when the mode / config changes or it is invalidated.
+    #[test]
+    fn registry_cache_reuses_until_the_key_changes() {
+        let cache = RegistryCache::default();
+        let key = |mode| RegistryKey { mode, config: None };
+        let mut builds = 0;
+        let a = cache.get_with(key(RegistryMode::Mock), |m| {
+            builds += 1;
+            shared_registry_for(m)
+        });
+        let b = cache.get_with(key(RegistryMode::Mock), |m| {
+            builds += 1;
+            shared_registry_for(m)
+        });
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(builds, 1);
+        assert_eq!(a.len(), ProviderId::ALL.len());
+
+        let changed = RegistryKey {
+            mode: RegistryMode::Mock,
+            config: Some((SystemTime::UNIX_EPOCH, 1)),
+        };
+        let c = cache.get_with(changed, shared_registry_for);
+        assert!(!Arc::ptr_eq(&a, &c));
+
+        cache.invalidate();
+        let d = cache.get(RegistryMode::Mock);
+        assert!(!Arc::ptr_eq(&c, &d));
+        assert!(d.iter().all(|p| ProviderId::ALL.contains(&p.id())));
     }
 
     /// With `refreshCredentials` on, the pass is honest about having no hook yet

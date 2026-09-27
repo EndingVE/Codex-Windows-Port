@@ -206,6 +206,16 @@ impl ProviderId {
         }
     }
 
+    /// The [`DataSource`] a snapshot of this provider carries when the refresh
+    /// pipeline has to synthesise one (timeout, panic) — derived from
+    /// [`ProviderId::auth_kind`].
+    pub const fn auth_kind_source(self) -> DataSource {
+        match self.auth_kind() {
+            AuthKind::ApiKey => DataSource::ApiKey,
+            AuthKind::LocalOAuthFile | AuthKind::DeviceFlow => DataSource::OAuth,
+        }
+    }
+
     /// Parse a provider id, tolerating the shapes humans actually type:
     /// case, spaces, dots and hyphens are stripped before matching, so
     /// `OpenCodeGo`, `opencode-go`, `OpenCode Go` and `opencodego` are the same
@@ -663,13 +673,54 @@ pub trait Provider: Send + Sync {
     fn fetch(&self, now: DateTime<Utc>) -> ProviderSnapshot;
 }
 
-/// Sequential fetch of every registered provider, in canonical order.
+/// Parallel fetch of every registered provider, in canonical order.
+///
+/// Providers are fetched concurrently on scoped threads (at most
+/// [`crate::refresh::DEFAULT_MAX_CONCURRENCY`] at a time), so the wall-clock
+/// cost is the slowest provider rather than the sum of all of them. Output
+/// order is always [`ProviderId::ALL`], whatever order they finish in.
+///
+/// For a per-provider deadline (abandoning a wedged fetch) use
+/// [`crate::refresh::collect_with`], which needs `Arc` providers.
 ///
 /// Providers with no credentials should return [`FetchStatus::NotConfigured`];
 /// they stay in the report so the UI can show a setup hint.
 pub fn collect(providers: &[Box<dyn Provider>]) -> UsageReport {
+    collect_parallel(providers, crate::refresh::DEFAULT_MAX_CONCURRENCY)
+}
+
+/// [`collect`] with an explicit concurrency cap (`0` is treated as `1`).
+pub fn collect_parallel(providers: &[Box<dyn Provider>], max_concurrency: usize) -> UsageReport {
     let now = Utc::now();
-    let mut snapshots: Vec<ProviderSnapshot> = providers.iter().map(|p| p.fetch(now)).collect();
+    let workers = max_concurrency.max(1).min(providers.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<ProviderSnapshot>>> = providers
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(provider) = providers.get(index) else {
+                    break;
+                };
+                let id = provider.id();
+                let snapshot =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.fetch(now)))
+                        .unwrap_or_else(|_| {
+                            crate::refresh::failed_snapshot(id, "provider fetch panicked", now)
+                        });
+                if let Ok(mut slot) = slots[index].lock() {
+                    *slot = Some(snapshot);
+                }
+            });
+        }
+    });
+    let mut snapshots: Vec<ProviderSnapshot> = slots
+        .into_iter()
+        .filter_map(|slot| slot.into_inner().ok().flatten())
+        .collect();
     snapshots.sort_by_key(|s| {
         ProviderId::ALL
             .iter()

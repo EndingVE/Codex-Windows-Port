@@ -13,11 +13,19 @@
 //! ```
 
 pub mod mock;
+pub mod refresh;
 pub mod types;
 
-pub use mock::{default_scenario, mock_json, mock_registry, mock_report, MockProvider, Scenario};
+pub use mock::{
+    default_scenario, mock_json, mock_registry, mock_registry_shared, mock_report, MockProvider,
+    Scenario,
+};
+pub use refresh::{
+    classify_error, collect_with, retain_last_good, CollectOptions, CollectResult, FailureClass,
+    OutcomeKind, ProviderBackoff, ProviderOutcome, ProviderRefreshStatus, RefreshStatus,
+};
 pub use types::{
-    collect, humanize, severity_for_used_percent, AuthKind, DataSource, FetchStatus, MoneyBalance,
-    NamedRateWindow, Provider, ProviderId, ProviderSnapshot, RateWindow, Severity, UsageReport,
-    WindowKind, SCHEMA_VERSION,
+    collect, collect_parallel, humanize, severity_for_used_percent, AuthKind, DataSource,
+    FetchStatus, MoneyBalance, NamedRateWindow, Provider, ProviderId, ProviderSnapshot, RateWindow,
+    Severity, UsageReport, WindowKind, SCHEMA_VERSION,
 };

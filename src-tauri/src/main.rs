@@ -8,8 +8,11 @@
 //!    fetches the first snapshot, installs **one tray icon per enabled provider**
 //!    (or a single merged icon), wires the popover window (created hidden by
 //!    `tauri.conf.json`) and reconciles the autostart Run entry.
-//! 3. A background tick refreshes every `refreshIntervalSecs` (default 300 s) and
-//!    pushes the new report to the UI through the `usage-updated` event.
+//! 3. A background refresh worker fetches every `refreshIntervalSecs` (default
+//!    300 s) **off the UI thread**, providers in parallel with a concurrency cap
+//!    and a per-provider deadline, then hands the result to the main thread,
+//!    which repaints only the trays that changed and pushes the report to the UI
+//!    through the `usage-updated` event (plus `refresh-status`).
 //! 4. Left-clicking a tray icon toggles the popover; the tray menu offers Open,
 //!    one row per enabled provider, the tray-display submenu (merge / percent /
 //!    icon selector), Refresh, Settings and Quit.
@@ -43,11 +46,16 @@ mod settings_window;
 mod token_store;
 mod tray_icon;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use codexbar_core::refresh::{
+    collect_with, retain_last_good, CollectOptions, OutcomeKind, ProviderBackoff, RefreshStatus,
+};
 use codexbar_core::{DataSource, FetchStatus, ProviderId, ProviderSnapshot, UsageReport};
 use codexbar_providers::providers::copilot::{DeviceCode, DeviceFlow};
 use tauri::{
@@ -84,10 +92,21 @@ static POPOVER_FALLBACK_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Shared application state.
 struct AppState {
-    report: Mutex<UsageReport>,
+    /// Latest published report. `Arc` so readers (commands, tray repaint) do
+    /// not deep-copy it on every access.
+    report: Mutex<Arc<UsageReport>>,
     settings: Mutex<Settings>,
     /// Ids of the tray icons currently installed, in display order.
     tray_ids: Mutex<Vec<String>>,
+    /// What each installed tray currently shows (icon key, tooltip) plus the
+    /// menu signature, so a refresh only touches what changed.
+    tray_cache: Mutex<TrayCache>,
+    /// Per-provider summary of the last refresh cycle (errors, stale, backoff).
+    refresh_status: Mutex<Option<RefreshStatus>>,
+    /// Provider registry reused across ticks (rebuilt on mode/config change).
+    registry: registry::RegistryCache,
+    /// Channel to the refresh worker (see [`spawn_refresh_worker`]).
+    refresh_tx: Mutex<Option<mpsc::Sender<RefreshRequest>>>,
     /// A started Copilot device flow, if one is waiting for the user.
     ///
     /// The device code stays in this process: it is the handshake secret for
@@ -98,19 +117,58 @@ struct AppState {
 }
 
 impl AppState {
-    fn snapshot(&self) -> UsageReport {
-        self.report
+    fn new(settings: Settings) -> Self {
+        Self {
+            report: Mutex::new(Arc::new(UsageReport::new(Vec::new()))),
+            settings: Mutex::new(settings),
+            tray_ids: Mutex::new(Vec::new()),
+            tray_cache: Mutex::new(TrayCache::default()),
+            refresh_status: Mutex::new(None),
+            registry: registry::RegistryCache::default(),
+            refresh_tx: Mutex::new(None),
+            copilot_flow: Mutex::new(None),
+            reauth: Mutex::new(reauth::ReauthManager::new()),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<UsageReport> {
+        Arc::clone(
+            &self
+                .report
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    fn store(&self, report: Arc<UsageReport>) {
+        let mut guard = self
+            .report
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = report;
+    }
+
+    fn refresh_status(&self) -> Option<RefreshStatus> {
+        self.refresh_status
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
     }
 
-    fn store(&self, report: &UsageReport) {
-        let mut guard = self
-            .report
+    fn set_refresh_status(&self, status: RefreshStatus) {
+        *self
+            .refresh_status
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *guard = report.clone();
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(status);
+    }
+
+    /// Queue a request for the refresh worker. Never blocks.
+    fn request_refresh(&self, request: RefreshRequest) -> bool {
+        self.refresh_tx
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .is_some_and(|tx| tx.send(request).is_ok())
     }
 
     fn settings(&self) -> Settings {
@@ -170,19 +228,43 @@ impl AppState {
 /// Current report. The UI calls this on load, then waits for `usage-updated`.
 #[tauri::command]
 fn get_report(state: tauri::State<'_, AppState>) -> UsageReport {
-    state.snapshot()
+    (*state.snapshot()).clone()
 }
 
 /// Alias kept for the popover as written in Ola 1A/1B.
 #[tauri::command]
 fn usage_snapshot(state: tauri::State<'_, AppState>) -> UsageReport {
-    state.snapshot()
+    (*state.snapshot()).clone()
 }
 
 /// Force a provider refresh and return the fresh report.
+///
+/// `async` so the webview's IPC never runs the fetch on the main thread: the
+/// request is queued to the refresh worker and awaited on a blocking pool
+/// thread. Backoff is bypassed for a manual refresh.
 #[tauri::command]
-fn refresh_now(app: AppHandle) -> UsageReport {
-    refresh(&app)
+async fn refresh_now(app: AppHandle) -> UsageReport {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let state = app.state::<AppState>();
+    if !state.request_refresh(RefreshRequest::Now {
+        reply: Some(reply_tx),
+    }) {
+        return (*state.snapshot()).clone();
+    }
+    let waited = tauri::async_runtime::spawn_blocking(move || reply_rx.recv()).await;
+    match waited {
+        Ok(Ok(report)) => (*report).clone(),
+        _ => (*app.state::<AppState>().snapshot()).clone(),
+    }
+}
+
+/// Per-provider outcome of the last refresh cycle: failure class (`auth`,
+/// `rateLimited`, `network`, `timeout`, `server`, `other`), whether the card
+/// shows last-known (stale) values, backoff countdown, and the global
+/// `offline` flag. `null` until the first cycle finished.
+#[tauri::command]
+fn refresh_status(state: tauri::State<'_, AppState>) -> Option<RefreshStatus> {
+    state.refresh_status()
 }
 
 /// Current settings (camelCase JSON, as persisted).
@@ -782,7 +864,10 @@ fn handle_menu(app: &AppHandle, id: &str) {
     match id {
         "open" => toggle_popover(app),
         "refresh" => {
-            refresh(app);
+            // Queued to the worker: the menu handler runs on the main thread
+            // and must never wait for the network.
+            app.state::<AppState>()
+                .request_refresh(RefreshRequest::Now { reply: None });
         }
         "settings" => settings_window::open(app),
         "quit" => app.exit(0),
@@ -801,6 +886,93 @@ fn handle_menu(app: &AppHandle, id: &str) {
             }
         }
     }
+}
+
+/// What the installed trays currently display, so a refresh can skip the
+/// shell calls (and the menu rebuild) when nothing visible changed.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct TrayCache {
+    /// tray id -> (icon key, tooltip)
+    visuals: HashMap<String, (String, String)>,
+    /// Signature of the menu currently attached to every tray.
+    menu: Option<String>,
+}
+
+/// What `sync_trays` has to do for a given installed / wanted icon set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayPlan {
+    /// Same icons: update the changed ones in place (no remove / re-create).
+    UpdateInPlace,
+    /// The set changed (provider toggled, merge flipped): rebuild the trays.
+    Reinstall,
+}
+
+fn tray_plan(current: &[String], desired: &[String]) -> TrayPlan {
+    if current == desired {
+        TrayPlan::UpdateInPlace
+    } else {
+        TrayPlan::Reinstall
+    }
+}
+
+/// Cheap identity of a tray icon's pixels: the percent it draws (to 0.1) and
+/// whether the number is printed.
+fn icon_key(percent: Option<f64>, show_percent: bool) -> String {
+    match percent {
+        Some(p) => format!("{:.1}|{show_percent}", p),
+        None => format!("none|{show_percent}"),
+    }
+}
+
+/// Icon key + tooltip a given tray id should show.
+fn tray_visual(report: &UsageReport, settings: &Settings, tray_id: &str) -> (String, String) {
+    if tray_id == TRAY_ID {
+        (
+            icon_key(
+                merged_percent(report, settings),
+                settings.show_percent_in_icon,
+            ),
+            merged_tooltip(report, settings),
+        )
+    } else if let Some(provider) = tray_id
+        .strip_prefix(TRAY_PREFIX)
+        .and_then(ProviderId::from_str_lossy)
+    {
+        (
+            icon_key(percent_of(report, provider), settings.show_percent_in_icon),
+            provider_tooltip(report, provider),
+        )
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+/// Everything `build_menu` renders, as one string: equal signatures mean an
+/// identical menu, so it does not have to be rebuilt.
+fn menu_signature(report: &UsageReport, settings: &Settings) -> String {
+    let mut sig = format!(
+        "{}|{}|{:?}|",
+        settings.merge_icons, settings.show_percent_in_icon, settings.merged_provider
+    );
+    for id in settings.enabled_providers() {
+        match report.providers.iter().find(|p| p.provider == id) {
+            Some(snapshot) => sig.push_str(&format!(
+                "{}:{}:{};",
+                id.as_str(),
+                describe(snapshot),
+                source_label(snapshot)
+            )),
+            None => sig.push_str(&format!("{}:-;", id.as_str())),
+        }
+    }
+    sig
+}
+
+fn tray_cache<'a>(state: &'a AppState) -> std::sync::MutexGuard<'a, TrayCache> {
+    state
+        .tray_cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Remove every installed tray icon.
@@ -869,49 +1041,82 @@ fn install_trays(app: &AppHandle) -> tauri::Result<()> {
         installed.push(TRAY_ID.to_string());
     }
 
+    let mut cache = TrayCache {
+        visuals: HashMap::new(),
+        menu: Some(menu_signature(&report, &settings)),
+    };
+    for id in &installed {
+        cache
+            .visuals
+            .insert(id.clone(), tray_visual(&report, &settings, id));
+    }
+    *tray_cache(&state) = cache;
     app.state::<AppState>().set_tray_ids(installed);
     Ok(())
 }
 
-/// Repaint the installed trays with the latest report.
+/// Repaint the installed trays with the latest report. **Main thread only.**
 ///
-/// When the icon set changed (a provider was enabled/disabled, merge toggled,
-/// the interval changed the layout) the trays are rebuilt; otherwise each icon
-/// is updated in place so the shell never sees the icons disappear.
+/// When the icon set changed (a provider was enabled/disabled, merge toggled)
+/// the trays are rebuilt. Otherwise nothing is removed or re-created: each
+/// icon's image and tooltip are replaced only when they differ from what it
+/// shows, and the menu is rebuilt only when its content changed.
 fn sync_trays(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let report = state.snapshot();
     let settings = state.settings();
     let desired = desired_tray_ids(&settings);
     let current = state.tray_ids();
 
-    if current == desired {
-        for id in &current {
-            let Some(tray) = app.tray_by_id(id) else {
-                continue;
-            };
-            if id == TRAY_ID {
-                let _ = tray.set_icon(Some(merged_icon(&report, &settings)));
-                let _ = tray.set_tooltip(Some(merged_tooltip(&report, &settings)));
-            } else if let Some(provider) = id
-                .strip_prefix(TRAY_PREFIX)
-                .and_then(ProviderId::from_str_lossy)
-            {
-                let _ = tray.set_icon(Some(provider_icon(
-                    &report,
-                    provider,
-                    settings.show_percent_in_icon,
-                )));
-                let _ = tray.set_tooltip(Some(provider_tooltip(&report, provider)));
-            }
-            if let Ok(menu) = build_menu(app, &report, &settings) {
-                let _ = tray.set_menu(Some(menu));
-            }
+    if tray_plan(&current, &desired) == TrayPlan::Reinstall {
+        if let Err(err) = install_trays(app) {
+            eprintln!("codexbar: could not install tray icons: {err}");
         }
+        return;
     }
 
-    if let Err(err) = install_trays(app) {
-        eprintln!("codexbar: could not install tray icons: {err}");
+    let report = state.snapshot();
+    let signature = menu_signature(&report, &settings);
+    let mut cache = tray_cache(&state);
+    let menu = if cache.menu.as_deref() == Some(signature.as_str()) {
+        None
+    } else {
+        match build_menu(app, &report, &settings) {
+            Ok(menu) => {
+                cache.menu = Some(signature);
+                Some(menu)
+            }
+            Err(err) => {
+                eprintln!("codexbar: could not rebuild the tray menu: {err}");
+                None
+            }
+        }
+    };
+
+    for id in &current {
+        let Some(tray) = app.tray_by_id(id) else {
+            continue;
+        };
+        let (key, tooltip) = tray_visual(&report, &settings, id);
+        let shown = cache.visuals.get(id).cloned().unwrap_or_default();
+        if shown.0 != key {
+            let image = if id == TRAY_ID {
+                merged_icon(&report, &settings)
+            } else {
+                let provider = id
+                    .strip_prefix(TRAY_PREFIX)
+                    .and_then(ProviderId::from_str_lossy)
+                    .unwrap_or(ProviderId::Codex);
+                provider_icon(&report, provider, settings.show_percent_in_icon)
+            };
+            let _ = tray.set_icon(Some(image));
+        }
+        if shown.1 != tooltip {
+            let _ = tray.set_tooltip(Some(tooltip.clone()));
+        }
+        cache.visuals.insert(id.clone(), (key, tooltip));
+        if let Some(menu) = &menu {
+            let _ = tray.set_menu(Some(menu.clone()));
+        }
     }
 }
 
@@ -925,6 +1130,7 @@ fn mutate_settings(app: &AppHandle, mutate: impl FnOnce(&mut Settings)) {
         eprintln!("codexbar: could not save settings: {err}");
     }
     state.set_settings(next.clone());
+    state.request_refresh(RefreshRequest::SettingsChanged);
     // Autostart is not touched here: no tray item changes it.
     sync_trays(app);
     let _ = app.emit_to(POPOVER, "settings-updated", &next);
@@ -944,6 +1150,8 @@ fn apply_settings(app: &AppHandle, incoming: Settings) -> Result<Settings, Strin
     }
     let path = settings::save(&next)?;
     app.state::<AppState>().set_settings(next.clone());
+    app.state::<AppState>()
+        .request_refresh(RefreshRequest::SettingsChanged);
 
     autostart::reconcile(next.start_at_login);
     sync_trays(app);
@@ -1055,12 +1263,34 @@ fn on_any_page_load(
 
 /// True when `elapsed` has reached the configured cadence.
 ///
-/// The tick below wakes once a second so a settings change takes effect without
-/// a restart; this is the gate that makes `refreshIntervalSecs` authoritative
-/// (and keeps a lower bound of 1 s even for a hand-edited config).
+/// This is the gate that makes `refreshIntervalSecs` authoritative (and keeps a
+/// lower bound of 1 s even for a hand-edited config).
 fn refresh_due(elapsed: Duration, interval_secs: u64) -> bool {
     elapsed >= Duration::from_secs(interval_secs.max(1))
 }
+
+/// How long the worker may sleep before the next scheduled refresh.
+fn time_until_due(elapsed: Duration, interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(1)).saturating_sub(elapsed)
+}
+
+/// Messages for the refresh worker.
+enum RefreshRequest {
+    /// Refresh right away, ignoring per-provider backoff (tray "Refresh now",
+    /// `refresh_now`, first fetch). `reply` receives the published report.
+    Now {
+        reply: Option<mpsc::Sender<Arc<UsageReport>>>,
+    },
+    /// Settings were saved: re-read the interval, rebuild the registry, and
+    /// refresh at once if the data mode (live / mock) changed.
+    SettingsChanged,
+}
+
+/// Concurrency cap and per-provider deadline for the tray's refresh.
+const COLLECT_OPTIONS: CollectOptions = CollectOptions {
+    max_concurrency: codexbar_core::refresh::DEFAULT_MAX_CONCURRENCY,
+    provider_timeout: codexbar_core::refresh::DEFAULT_PROVIDER_TIMEOUT,
+};
 
 /// Run the `refreshCredentials` pass, or nothing at all.
 ///
@@ -1068,7 +1298,7 @@ fn refresh_due(elapsed: Duration, interval_secs: u64) -> bool {
 /// performs no credential write of any kind. The pass itself is honest about
 /// this build having no provider-side hook yet (see `registry.rs`), so turning
 /// the setting on never fabricates a "refreshed" result.
-fn apply_credential_refresh(settings: &Settings, providers: &[Box<dyn codexbar_core::Provider>]) {
+fn apply_credential_refresh<P>(settings: &Settings, providers: &[P]) {
     if !settings.refresh_credentials {
         return;
     }
@@ -1090,21 +1320,151 @@ fn apply_credential_refresh(settings: &Settings, providers: &[Box<dyn codexbar_c
     }
 }
 
-/// Fetch every provider the current settings call for, then update state, trays
-/// and UI.
-fn refresh(app: &AppHandle) -> UsageReport {
-    let settings = app.state::<AppState>().settings();
+/// One refresh cycle. **Runs on the refresh worker thread, never on the main
+/// thread**: providers are fetched in parallel (bounded, with a deadline each),
+/// transient failures keep the last good numbers as `stale`, a machine that
+/// looks offline gets no retry storm, and only the finished report is handed
+/// to the main thread for the tray repaint.
+fn run_refresh_cycle(
+    app: &AppHandle,
+    backoff: &mut ProviderBackoff,
+    manual: bool,
+) -> (Arc<UsageReport>, RegistryMode) {
+    let state = app.state::<AppState>();
+    let settings = state.settings();
     let mode = RegistryMode::from_settings(&settings);
-    let providers = registry::registry_for(mode);
-    apply_credential_refresh(&settings, &providers);
-    let report = codexbar_core::collect(&providers);
-    app.state::<AppState>().store(&report);
-    sync_trays(app);
-    if let Err(err) = app.emit_to(POPOVER, "usage-updated", &report) {
-        // Expected while the webview has not finished loading yet.
-        eprintln!("codexbar: could not notify UI: {err}");
+    let providers = state.registry.get(mode);
+    apply_credential_refresh(&settings, providers.as_slice());
+
+    let previous = state.snapshot();
+    let started = Instant::now();
+    let before = codexbar_providers::connectivity();
+    // A provider backing off keeps its previous card for this cycle. A manual
+    // refresh is the user asking "try again now", so it ignores the backoff.
+    let skip = |id: ProviderId| -> Option<ProviderSnapshot> {
+        if manual || !backoff.should_skip(id, started) {
+            return None;
+        }
+        previous.get(id).cloned()
+    };
+    let result = collect_with(&providers, COLLECT_OPTIONS, chrono::Utc::now(), &skip);
+
+    let delta = codexbar_providers::connectivity().since(before);
+    let offline = mode == RegistryMode::Live && delta.looks_offline();
+    // While offline the HTTP layer makes one attempt per request (no retry
+    // loop); the first response of any kind clears it.
+    codexbar_providers::set_offline_hint(offline);
+
+    for outcome in &result.outcomes {
+        if outcome.kind != OutcomeKind::Skipped {
+            backoff.record(outcome.provider, outcome.failure(), started);
+        }
     }
-    report
+    let published = UsageReport::new(
+        result
+            .report
+            .providers
+            .into_iter()
+            .map(|fresh| retain_last_good(Some(&previous), fresh, offline))
+            .collect(),
+    );
+    let status = RefreshStatus::from_outcomes(
+        &result.outcomes,
+        &published,
+        offline,
+        backoff,
+        Instant::now(),
+    );
+    if offline {
+        eprintln!("codexbar: no network — keeping the last known values");
+    }
+    let report = Arc::new(published);
+    state.store(Arc::clone(&report));
+    state.set_refresh_status(status.clone());
+    apply_refresh_on_main_thread(app, Arc::clone(&report), status);
+    (report, mode)
+}
+
+/// Hand a finished report to the main thread: tray icons and menus belong to
+/// it (tao/WebView2 fail when they are touched from another thread).
+fn apply_refresh_on_main_thread(app: &AppHandle, report: Arc<UsageReport>, status: RefreshStatus) {
+    let handle = app.clone();
+    let dispatched = app.run_on_main_thread(move || {
+        sync_trays(&handle);
+        if let Err(err) = handle.emit_to(POPOVER, "usage-updated", &*report) {
+            // Expected while the webview has not finished loading yet.
+            eprintln!("codexbar: could not notify UI: {err}");
+        }
+        let _ = handle.emit_to(POPOVER, "refresh-status", &status);
+        let _ = handle.emit_to(settings_window::SETTINGS_WINDOW, "refresh-status", &status);
+    });
+    if let Err(err) = dispatched {
+        eprintln!("codexbar: could not schedule the tray update: {err}");
+    }
+}
+
+/// Start the refresh worker thread and return its request channel.
+///
+/// The worker sleeps on the channel until the next refresh is due (no 1 s
+/// polling), wakes early for a manual refresh or a settings change, and runs
+/// every fetch itself — the main thread only ever receives finished reports.
+/// It performs the first fetch immediately.
+fn spawn_refresh_worker(app: &AppHandle) -> mpsc::Sender<RefreshRequest> {
+    let (tx, rx) = mpsc::channel::<RefreshRequest>();
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("codexbar-refresh".into())
+        .spawn(move || {
+            let mut backoff = ProviderBackoff::default();
+            let (_, mut last_mode) = run_refresh_cycle(&handle, &mut backoff, true);
+            let mut last = Instant::now();
+            loop {
+                let interval = handle.state::<AppState>().settings().refresh_interval_secs;
+                let wait = time_until_due(last.elapsed(), interval);
+                let request = match rx.recv_timeout(wait) {
+                    Ok(request) => Some(request),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let (manual, reply) = match request {
+                    None => {
+                        if !refresh_due(last.elapsed(), interval) {
+                            continue;
+                        }
+                        (false, None)
+                    }
+                    Some(RefreshRequest::Now { reply }) => {
+                        handle.state::<AppState>().registry.invalidate();
+                        (true, reply)
+                    }
+                    Some(RefreshRequest::SettingsChanged) => {
+                        let settings = handle.state::<AppState>().settings();
+                        if RegistryMode::from_settings(&settings) == last_mode {
+                            continue; // new interval is picked up on the next wait
+                        }
+                        backoff.reset();
+                        (true, None)
+                    }
+                };
+                // Coalesce a burst of clicks into this one cycle.
+                let mut replies: Vec<mpsc::Sender<Arc<UsageReport>>> = reply.into_iter().collect();
+                while let Ok(extra) = rx.try_recv() {
+                    if let RefreshRequest::Now { reply: Some(r) } = extra {
+                        replies.push(r);
+                    }
+                }
+                let (report, mode) = run_refresh_cycle(&handle, &mut backoff, manual);
+                last_mode = mode;
+                last = Instant::now();
+                for reply in replies {
+                    let _ = reply.send(Arc::clone(&report));
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("codexbar: could not start the refresh worker: {err}");
+    }
+    tx
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1779,7 @@ fn main() {
             reauth_status,
             reauth_cancel,
             session_states,
+            refresh_status,
             open_settings,
             hide_settings,
             hide_popover,
@@ -1433,13 +1794,7 @@ fn main() {
             // Start with an empty report so a slow live provider can never delay
             // the tray or the popover: the first fetch runs below, after the
             // window exists, and the UI gets the real payload from `get_report`.
-            app.manage(AppState {
-                report: Mutex::new(UsageReport::new(Vec::new())),
-                settings: Mutex::new(settings.clone()),
-                tray_ids: Mutex::new(Vec::new()),
-                copilot_flow: Mutex::new(None),
-                reauth: Mutex::new(reauth::ReauthManager::new()),
-            });
+            app.manage(AppState::new(settings.clone()));
 
             install_trays(&handle)?;
 
@@ -1475,10 +1830,11 @@ fn main() {
                         tauri::WindowEvent::Focused(true) => {
                             armed_for_events.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
-                        tauri::WindowEvent::Focused(false) => {
-                            if armed_for_events.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                                let _ = win_for_events.hide();
-                            }
+                        tauri::WindowEvent::Focused(false)
+                            if armed_for_events
+                                .swap(false, std::sync::atomic::Ordering::SeqCst) =>
+                        {
+                            let _ = win_for_events.hide();
                         }
                         _ => {}
                     });
@@ -1488,41 +1844,23 @@ fn main() {
                 }
             }
 
-            // First fetch: ran after the window exists so a slow provider cannot
-            // delay the tray or the popover, and on the main thread so the tray
-            // images and menus are built by the same thread that owns them.
-            let report = refresh(&handle);
-
-            // Background tick: sleep in one-second slices so a settings change
-            // (new refreshIntervalSecs) takes effect without a restart — the
-            // interval and `refreshCredentials` are read from the live settings
-            // every wake-up. Tray and menu mutations are dispatched back to the
-            // main thread.
-            let tick_handle = handle.clone();
-            std::thread::spawn(move || {
-                let mut last = Instant::now();
-                loop {
-                    std::thread::sleep(Duration::from_secs(1));
-                    let interval = tick_handle
-                        .state::<AppState>()
-                        .settings()
-                        .refresh_interval_secs;
-                    if !refresh_due(last.elapsed(), interval) {
-                        continue;
-                    }
-                    last = Instant::now();
-                    let h = tick_handle.clone();
-                    let _ = tick_handle.run_on_main_thread(move || {
-                        refresh(&h);
-                    });
-                }
-            });
+            // Refresh worker: does the first fetch right away and then one per
+            // `refreshIntervalSecs`, all off the main thread, so a slow provider
+            // can never delay the tray, the menus or the popover. Only the
+            // finished report is dispatched back to the main thread, which
+            // owns the tray images and menus.
+            let worker = spawn_refresh_worker(&handle);
+            *handle
+                .state::<AppState>()
+                .refresh_tx
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(worker);
 
             eprintln!(
                 "codexbar-win {} ready — {} mode, {} providers, {} tray icon(s), config {}",
                 env!("CARGO_PKG_VERSION"),
                 mode.as_str(),
-                report.providers.len(),
+                ProviderId::ALL.len(),
                 handle.state::<AppState>().tray_ids().len(),
                 settings::config_path().display()
             );
@@ -1579,6 +1917,85 @@ mod cli_tests {
         // A hand-edited 0 can never turn the loop into a busy spin.
         assert!(!refresh_due(Duration::from_millis(500), 0));
         assert!(refresh_due(Duration::from_secs(1), 0));
+    }
+
+    /// The worker sleeps exactly until the next refresh is due, never negative.
+    #[test]
+    fn worker_sleeps_until_the_next_refresh() {
+        assert_eq!(
+            time_until_due(Duration::from_secs(10), 60),
+            Duration::from_secs(50)
+        );
+        assert_eq!(time_until_due(Duration::from_secs(90), 60), Duration::ZERO);
+        assert_eq!(time_until_due(Duration::ZERO, 0), Duration::from_secs(1));
+    }
+
+    // ---- tray reconciliation ----------------------------------------------
+
+    /// A refresh with unchanged settings must update the trays in place, never
+    /// remove and re-create them (that is what made the icons blink).
+    #[test]
+    fn unchanged_settings_update_trays_in_place() {
+        let settings = Settings::default();
+        let current = desired_tray_ids(&settings);
+        assert_eq!(
+            desired_tray_ids(&settings.clone()),
+            current,
+            "desired ids are deterministic"
+        );
+        assert_eq!(
+            tray_plan(&current, &desired_tray_ids(&settings)),
+            TrayPlan::UpdateInPlace
+        );
+
+        let merged = Settings {
+            merge_icons: !settings.merge_icons,
+            ..settings.clone()
+        };
+        assert_eq!(
+            tray_plan(&current, &desired_tray_ids(&merged)),
+            TrayPlan::Reinstall
+        );
+        assert_eq!(tray_plan(&[], &current), TrayPlan::Reinstall);
+    }
+
+    /// The menu signature changes exactly when the menu content would, so an
+    /// unchanged report does not rebuild the menu.
+    #[test]
+    fn menu_signature_tracks_visible_content_only() {
+        let settings = Settings::default();
+        let enabled = settings.enabled_providers();
+        let id = *enabled.first().expect("a provider is enabled by default");
+        let make = |used: f64| {
+            UsageReport::new(vec![snapshot(
+                id,
+                FetchStatus::Ok,
+                None,
+                DataSource::OAuth,
+                Some(used),
+            )])
+        };
+        let a = make(40.0);
+        let mut b = make(40.0);
+        b.generated_at = a.generated_at + chrono::Duration::minutes(5);
+        assert_eq!(menu_signature(&a, &settings), menu_signature(&b, &settings));
+        assert_ne!(
+            menu_signature(&a, &settings),
+            menu_signature(&make(41.0), &settings)
+        );
+        let toggled = Settings {
+            show_percent_in_icon: !settings.show_percent_in_icon,
+            ..settings.clone()
+        };
+        assert_ne!(menu_signature(&a, &settings), menu_signature(&a, &toggled));
+    }
+
+    #[test]
+    fn icon_key_ignores_sub_decimal_noise() {
+        assert_eq!(icon_key(Some(41.99), true), icon_key(Some(42.0), true));
+        assert_ne!(icon_key(Some(41.0), true), icon_key(Some(42.0), true));
+        assert_ne!(icon_key(Some(42.0), true), icon_key(Some(42.0), false));
+        assert_ne!(icon_key(None, true), icon_key(Some(0.0), true));
     }
 
     /// The normalized settings are what the loop reads, so the clamp is part of

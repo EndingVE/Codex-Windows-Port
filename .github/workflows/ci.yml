@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  gate:
+    name: fmt / clippy / test (windows)
+    # The app is Windows-only (Tauri 2 + WebView2). windows-latest already ships
+    # the MSVC build tools, the Windows SDK and the WebView2 runtime, which is
+    # everything `tauri-build` and the `codexbar-win` crate need to compile and
+    # run their unit tests; no Node / npm step is needed (the UI is plain files).
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in sync with `channel` in rust-toolchain.toml so the local gate and
+      # CI run the exact same rustfmt / clippy.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Build leaves the tree clean
+        shell: bash
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"

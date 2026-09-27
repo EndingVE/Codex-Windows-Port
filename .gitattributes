@@ -1,0 +1,4 @@
+# tauri-build regenerates these schemas on every build and always writes LF.
+# Pin LF in the working tree too, so core.autocrlf=true checkouts (CRLF) do not
+# show them as modified after each cargo build/clippy/test.
+src-tauri/gen/schemas/*.json text eol=lf -diff

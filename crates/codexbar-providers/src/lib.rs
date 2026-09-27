@@ -9,7 +9,7 @@
 //!
 //! | Module | What it gives a provider worker |
 //! | --- | --- |
-//! | [`http`] | `HttpRequest`/`HttpResponse`, the [`HttpClient`] seam, the HTTPS endpoint policy, a redacting `Debug` |
+//! | [`http`] | `HttpRequest`/`HttpResponse`, the [`HttpClient`] seam, the shared pooled client with retry/backoff ([`RetryingClient`]), connectivity counters, the HTTPS endpoint policy, a redacting `Debug` |
 //! | [`credential`] | `Secret` (prints as `<redacted>`), the canonical `cleaned()` rule, a case-insensitive `Env`, the read-only `PortConfig` |
 //! | [`oauth`] | refresh-token grant + the crate's only credential write (atomic, with `.bak`) |
 //! | [`testing`] | `FixtureClient` so provider tests never touch the network |
@@ -55,8 +55,10 @@ pub use credential::{
     redact_secrets_in_text, CredentialError, Env, PortConfig, Secret,
 };
 pub use http::{
-    default_client, ensure_https, host_is_allowed, secure_base_url, shared_client, FailingClient,
-    HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse, Method,
+    connectivity, default_client, ensure_https, host_is_allowed, offline_hint, parse_retry_after,
+    retry_decision, secure_base_url, set_offline_hint, shared_client, ConnectivityCounters,
+    FailingClient, HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse, Method,
+    RetryPolicy, RetryingClient,
 };
 pub use oauth::{
     refresh, write_json_atomic, OAuthError, RefreshRequest, RefreshedToken, REFRESH_TIMEOUT,
@@ -80,6 +82,13 @@ use codexbar_core::{Provider, ProviderId};
 /// provider worker edits.
 pub fn live_registry() -> Vec<Box<dyn Provider>> {
     live_registry_with(shared_client())
+}
+
+/// [`live_registry`] as shared (`Arc`) providers, for
+/// `codexbar_core::refresh::collect_with`, which can abandon a provider that
+/// overruns its deadline.
+pub fn live_registry_shared() -> Vec<Arc<dyn Provider>> {
+    live_registry().into_iter().map(Arc::from).collect()
 }
 
 /// Same as [`live_registry`] but with an injected client.
@@ -172,6 +181,14 @@ mod tests {
     use codexbar_core::{collect, FetchStatus};
 
     use testing::FixtureResponse;
+
+    /// Every production provider shares one HTTP client (one pool, one TLS
+    /// config) instead of building its own.
+    #[test]
+    fn production_providers_share_one_client() {
+        assert!(Arc::ptr_eq(&shared_client(), &shared_client()));
+        assert_eq!(live_registry_shared().len(), ProviderId::ALL.len());
+    }
 
     /// 14 providers, canonical order, one entry each.
     #[test]
