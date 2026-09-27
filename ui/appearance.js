@@ -71,19 +71,35 @@
     return Math.round(value * 100) + "%";
   }
 
+  /** Paint the filled part of a range track (accent up to the thumb). */
+  function paintFill(input) {
+    const min = Number(input.min) || 0;
+    const max = Number(input.max) || 100;
+    const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
+    input.style.setProperty("--fill", Math.max(0, Math.min(100, pct)) + "%");
+  }
+
   function paint(a) {
     paintSegmented(els.theme, a.theme);
     paintSegmented(els.density, a.density);
+    let presetMatch = false;
     els.swatches.querySelectorAll(".swatch").forEach((btn) => {
-      btn.setAttribute("aria-checked", String(btn.dataset.hex === a.accent));
+      const on = btn.dataset.hex === a.accent;
+      presetMatch = presetMatch || on;
+      btn.setAttribute("aria-checked", String(on));
     });
-    if (els.picker) els.picker.value = a.accent;
+    if (els.picker) {
+      els.picker.value = a.accent;
+      // Only the picker carries the "selected" ring when no preset matches,
+      // so a preset accent is never shown as selected twice.
+      els.picker.dataset.selected = String(!presetMatch);
+    }
     if (els.hex && document.activeElement !== els.hex) els.hex.value = a.accent;
     if (els.contrast) {
       const on = T.textOn(a.accent);
       const ratio = T.contrast(on, a.accent);
-      els.contrast.textContent =
-        "Text on accent " + ratio.toFixed(1) + ":1 " + (ratio >= 4.5 ? "· AA" : "· below AA");
+      const grade = ratio >= 7 ? "AAA" : ratio >= 4.5 ? "AA" : "below AA";
+      els.contrast.textContent = "Text on accent " + ratio.toFixed(1) + ":1 · " + grade;
     }
     els.scale.value = String(a.fontScale);
     els.scaleOut.textContent = a.fontScale + "%";
@@ -91,6 +107,7 @@
     els.popoverOut.textContent = pctLabel(a.popoverOpacity);
     els.widget.value = String(Math.round(a.widgetOpacity * 100));
     els.widgetOut.textContent = pctLabel(a.widgetOpacity);
+    [els.scale, els.popover, els.widget].forEach(paintFill);
     if (els.legend) els.legend.setAttribute("aria-checked", String(!!a.showLegend));
   }
 
@@ -139,6 +156,9 @@
     }
   });
 
+  [els.scale, els.popover, els.widget].forEach((input) =>
+    input.addEventListener("input", () => paintFill(input))
+  );
   els.scale.addEventListener("input", () => commit({ fontScale: Number(els.scale.value) }, 150));
   els.popover.addEventListener("input", () =>
     commit({ popoverOpacity: Number(els.popover.value) / 100 }, 150)

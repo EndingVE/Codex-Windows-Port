@@ -95,6 +95,9 @@
   --ring-soft: rgba(255, 255, 255, 0.18);
   --shadow: rgba(0, 0, 0, 0.45);
   --switch-knob: #f2f5f9;
+  --range-empty: #666e7e; /* 3.4:1 on --surface */
+  --switch-knob-on: #ffffff;
+  --knob-shadow: rgba(0, 0, 0, 0.45);
   --logo-filter: brightness(0) invert(1);
   --cancel-filter: invert(0.7);
 
@@ -178,6 +181,9 @@
   --ring-soft: rgba(20, 23, 28, 0.18);
   --shadow: rgba(15, 20, 30, 0.18);
   --switch-knob: #ffffff;
+  --range-empty: #868d99; /* 3.3:1 on --surface */
+  --switch-knob-on: #ffffff;
+  --knob-shadow: rgba(0, 0, 0, 0.3);
   --logo-filter: brightness(0);
   --cancel-filter: invert(0.3);
 }
@@ -795,7 +801,7 @@ body.settings-page { overflow: hidden; font-size: calc(13px * var(--ui-scale)); 
   width: 38px;
   height: 22px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--range-empty); /* off state stays visible */
   background: var(--surface-3);
   cursor: pointer;
   transition: background 140ms ease, border-color 140ms ease;
@@ -808,10 +814,12 @@ body.settings-page { overflow: hidden; font-size: calc(13px * var(--ui-scale)); 
   width: 16px; height: 16px;
   border-radius: 50%;
   background: var(--switch-knob);
+  box-shadow: 0 1px 2px var(--shadow), 0 0 0 1px var(--ring-soft);
   transition: transform 140ms ease;
 }
 .switch[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
-.switch[aria-checked="true"]::after { transform: translateX(16px); background: var(--on-accent); }
+/* Knob stays a light surface on the accent (never black) with a soft shadow. */
+.switch[aria-checked="true"]::after { transform: translateX(16px); background: var(--switch-knob-on); box-shadow: 0 1px 3px var(--knob-shadow); }
 
 /* select */
 .select {
@@ -1020,8 +1028,9 @@ input.select::-webkit-search-cancel-button { filter: var(--cancel-filter); }
   cursor: pointer;
   padding: 0;
 }
-.swatch[aria-checked="true"] {
-  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--swatch);
+.swatch[aria-checked="true"],
+.color-input[data-selected="true"] {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
 }
 .color-input {
   width: 30px; height: 24px;
@@ -1042,20 +1051,27 @@ input.select::-webkit-search-cancel-button { filter: var(--cancel-filter); }
   background: transparent;
   cursor: pointer;
 }
+/* --fill (0–100%) is written by appearance.js on load and on every input. */
 .range::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 999px;
-  background: var(--surface-4);
+  background: linear-gradient(
+    to right,
+    var(--accent) 0 var(--fill, 0%),
+    var(--range-empty) var(--fill, 0%) 100%
+  );
 }
 .range::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px; height: 14px;
-  margin-top: -5px;
+  width: 16px; height: 16px;
+  margin-top: -6px;
   border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--surface);
-  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--switch-knob);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px var(--shadow);
 }
+.range:focus-visible { outline: none; }
+.range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--ring-soft), 0 1px 3px var(--shadow); }
 .range-out {
   min-width: 40px;
   text-align: right;
