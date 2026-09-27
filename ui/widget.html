@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <title>CodexBar Widget</title>
+  <link rel="stylesheet" href="widget.css" />
+  <!-- Theme publisher from the Appearance slice. Optional: when the file is
+       missing (older build) the `onerror` keeps the page quiet and widget.css
+       falls back to its own palette. -->
+  <script src="theme.js" onerror="window.__CODEXBAR_NO_THEME__ = true"></script>
+</head>
+<body class="widget-page">
+  <main class="widget" id="widget" aria-label="CodexBar usage widget">
+    <header class="widget-grip" id="grip" data-drag-region title="Drag to move">
+      <span class="widget-brand" aria-hidden="true">
+        <span class="widget-brand-dot"></span>CodexBar
+      </span>
+      <span class="widget-stale" id="stale" hidden></span>
+      <span class="widget-tools">
+        <button type="button" class="widget-btn" id="btn-pin" title="Always on top" aria-pressed="true">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 1.5h4l-.6 4 2.6 2.5v1H8.6v5.5L8 15.5l-.6-1V9H4v-1l2.6-2.5z"/></svg>
+        </button>
+        <button type="button" class="widget-btn" id="btn-lock" title="Lock position" aria-pressed="false">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 7V5a3.5 3.5 0 0 1 7 0v2h1v7h-9V7zm1.6 0h3.8V5a1.9 1.9 0 0 0-3.8 0z"/></svg>
+        </button>
+        <button type="button" class="widget-btn" id="btn-hide" title="Hide widget (reopen from the tray)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </span>
+    </header>
+    <ol class="widget-rows" id="rows" aria-live="polite"></ol>
+    <p class="widget-empty" id="empty" hidden>No active providers</p>
+  </main>
+  <script src="platform.js"></script>
+  <script src="mock.js"></script>
+  <script src="format.js"></script>
+  <script src="widget.js"></script>
+</body>
+</html>

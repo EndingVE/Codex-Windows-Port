@@ -1,0 +1,286 @@
+/* CodexBar for Windows — floating desktop widget.
+ *
+ * Every colour reads the variables published by the Appearance slice
+ * (`ui/theme.js` → `window.CodexBarTheme`, applied on <html>) and falls back to
+ * this file's own palette, so the widget looks right whether or not theme.js
+ * exists in the build. The window itself is transparent: the rounded card
+ * below is the only opaque surface, with `--widget-opacity` for translucency.
+ */
+
+:root {
+  --w-bg: var(--surface, #16191f);
+  --w-bg-2: var(--surface-3, #23272f);
+  --w-border: var(--border, #2a303a);
+  --w-text: var(--text, #eef1f6);
+  --w-muted: var(--muted, #b4bcc9);
+  --w-dim: var(--dim, #99a2b1);
+  --w-accent: var(--accent, #6ea8fe);
+  --w-healthy: var(--healthy, #35c46b);
+  --w-warning: var(--warning, #f0a02a);
+  --w-critical: var(--critical, #f2564f);
+  --w-track: var(--track, rgba(255, 255, 255, 0.08));
+  --w-opacity: var(--widget-opacity, 0.94);
+  --w-font: var(--font, ui-sans-serif, system-ui, "Segoe UI Variable Text", "Segoe UI", Roboto, Arial, sans-serif);
+  --w-scale: var(--font-scale, 1);
+  --w-radius: 12px;
+  --w-icon-filter: brightness(0) invert(1);
+}
+
+/* Light fallback when theme.js is absent but the OS (or a data-theme hint)
+ * asks for light. theme.js, when present, overrides these through its own
+ * variables, which take precedence via the var() chains above. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --w-bg: var(--surface, #ffffff);
+    --w-bg-2: var(--surface-3, #eef1f5);
+    --w-border: var(--border, #d6dbe3);
+    --w-text: var(--text, #171a21);
+    --w-muted: var(--muted, #4a5261);
+    --w-dim: var(--dim, #5c6575);
+    --w-track: var(--track, rgba(0, 0, 0, 0.08));
+    --w-healthy: var(--healthy, #1f9d52);
+    --w-warning: var(--warning, #b86e00);
+    --w-critical: var(--critical, #d1352e);
+    --w-icon-filter: brightness(0) invert(0.2);
+  }
+}
+:root[data-theme="light"] {
+  --w-bg: var(--surface, #ffffff);
+  --w-bg-2: var(--surface-3, #eef1f5);
+  --w-border: var(--border, #d6dbe3);
+  --w-text: var(--text, #171a21);
+  --w-muted: var(--muted, #4a5261);
+  --w-dim: var(--dim, #5c6575);
+  --w-track: var(--track, rgba(0, 0, 0, 0.08));
+  --w-healthy: var(--healthy, #1f9d52);
+  --w-warning: var(--warning, #b86e00);
+  --w-critical: var(--critical, #d1352e);
+  --w-icon-filter: brightness(0) invert(0.2);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: var(--w-font);
+  font-size: calc(12px * var(--w-scale));
+  line-height: 1.3;
+  color: var(--w-text);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.widget {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  border-radius: var(--w-radius);
+  border: 1px solid var(--w-border);
+  overflow: hidden;
+}
+/* Background on a pseudo-element so the opacity never fades the text. */
+.widget::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--w-bg);
+  opacity: var(--w-opacity);
+}
+
+.widget-grip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 26px;
+  padding: 0 4px 0 10px;
+  cursor: grab;
+  border-bottom: 1px solid var(--w-border);
+}
+.widget.is-locked .widget-grip { cursor: default; }
+
+.widget-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.92em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--w-muted);
+}
+.widget-brand-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--w-accent);
+}
+
+.widget-stale {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--w-warning);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.widget-tools {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 1px;
+  opacity: 0.55;
+  transition: opacity 120ms;
+}
+.widget:hover .widget-tools,
+.widget-tools:focus-within { opacity: 1; }
+
+.widget-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--w-dim);
+  cursor: pointer;
+}
+.widget-btn svg { width: 12px; height: 12px; fill: currentColor; }
+.widget-btn:hover { background: var(--w-bg-2); color: var(--w-text); }
+.widget-btn[aria-pressed="true"] { color: var(--w-accent); }
+.widget-btn:focus-visible { outline: 2px solid var(--w-accent); outline-offset: -2px; }
+
+.widget-rows {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  flex: 1;
+  scrollbar-width: thin;
+}
+
+.widget-row {
+  display: grid;
+  grid-template-columns: 16px minmax(58px, 1.15fr) minmax(40px, 1.2fr) 34px minmax(40px, auto);
+  align-items: center;
+  column-gap: 8px;
+  height: calc(24px * var(--w-scale));
+  padding: 0 10px;
+}
+.widget-row + .widget-row { border-top: 1px solid color-mix(in srgb, var(--w-border) 45%, transparent); }
+
+/* Provider marks come with mixed fills (cursor/copilot near-black, codex
+ * white), so — like the popover's .logo-chip — they are flattened to one
+ * silhouette colour that reads on the current surface. */
+.widget-icon {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  filter: var(--w-icon-filter);
+  opacity: 0.9;
+}
+.widget-icon-fallback {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--w-bg-2);
+  color: var(--w-muted);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.widget-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.widget-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--w-track);
+  overflow: hidden;
+}
+.widget-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--w-healthy);
+}
+.widget-row[data-tone="warning"] .widget-bar-fill { background: var(--w-warning); }
+.widget-row[data-tone="critical"] .widget-bar-fill { background: var(--w-critical); }
+
+.widget-pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.widget-row[data-tone="warning"] .widget-pct { color: var(--w-warning); }
+.widget-row[data-tone="critical"] .widget-pct { color: var(--w-critical); }
+
+.widget-reset {
+  text-align: right;
+  color: var(--w-dim);
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Rows without numbers (error, not set up, stale snapshot). */
+.widget-row.is-muted .widget-name,
+.widget-row.is-muted .widget-pct { color: var(--w-dim); }
+.widget-row.is-muted .widget-bar-fill { opacity: 0.45; }
+.widget-row.is-stale .widget-pct::after {
+  content: "·";
+  margin-left: 2px;
+  color: var(--w-warning);
+}
+.widget-row .widget-note {
+  grid-column: 3 / span 3;
+  color: var(--w-dim);
+  font-size: 0.92em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.widget-row[data-tone="error"] .widget-note { color: var(--w-critical); }
+
+.widget-empty {
+  margin: auto;
+  padding: 12px;
+  color: var(--w-dim);
+  text-align: center;
+}
+
+/* Static previews (no Tauri): paint a desktop-like backdrop behind the
+ * transparent window so renders show the card's real edges. */
+body.is-preview {
+  min-height: 100vh;
+  height: auto;
+  padding: 14px;
+  background: linear-gradient(135deg, #3c4a63 0%, #6b5b7b 55%, #a0767a 100%);
+}
+/* Headless browsers enforce a ~500 px minimum viewport; keep the preview card
+ * at a realistic widget size instead of stretching it. */
+body.is-preview .widget { width: 320px; height: auto; }
+html:has(body.is-preview) { min-height: 100%; background: #3c4a63; }
+:root[data-theme="light"] body.is-preview {
+  background: linear-gradient(135deg, #b9d3ee 0%, #dcd3ea 55%, #f1d9cf 100%);
+}
+
+/* Compact: very narrow widgets drop the reset column. */
+@media (max-width: 240px) {
+  .widget-row { grid-template-columns: 16px minmax(40px, 1fr) minmax(30px, 1fr) 36px; }
+  .widget-reset { display: none; }
+}
