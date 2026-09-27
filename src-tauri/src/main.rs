@@ -1830,10 +1830,11 @@ fn main() {
                         tauri::WindowEvent::Focused(true) => {
                             armed_for_events.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
-                        tauri::WindowEvent::Focused(false) => {
-                            if armed_for_events.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                                let _ = win_for_events.hide();
-                            }
+                        tauri::WindowEvent::Focused(false)
+                            if armed_for_events
+                                .swap(false, std::sync::atomic::Ordering::SeqCst) =>
+                        {
+                            let _ = win_for_events.hide();
                         }
                         _ => {}
                     });

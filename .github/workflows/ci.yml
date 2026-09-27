@@ -30,8 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep in sync with `channel` in rust-toolchain.toml so the local gate and
+      # CI run the exact same rustfmt / clippy.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
