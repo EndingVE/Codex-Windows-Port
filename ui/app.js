@@ -304,14 +304,18 @@
   /** Legend is static — build it once. */
   els.legend.replaceWith(Object.assign(R.renderLegend(), { id: "legend" }));
 
-  /** Display → "Show the colour legend" lives in uiPrefs, so the popover and
-   *  the settings window agree without a round-trip through Rust. */
-  function applyLegendPref() {
+  /** Appearance → "Show the colour legend" lives in appearance.json (it used
+   *  to be webview localStorage; theme.js migrates the old value once) and
+   *  arrives live through `appearance-changed`. */
+  const Theme = window.CodexBarTheme;
+  function applyLegendPref(appearance) {
     const foot = document.getElementById("cardsFoot");
-    if (foot) foot.hidden = !F.uiPrefs.get("showLegend", true);
+    const a = appearance || (Theme ? Theme.current() : null);
+    if (foot) foot.hidden = a ? a.showLegend === false : !F.uiPrefs.get("showLegend", true);
   }
   applyLegendPref();
-  window.addEventListener("storage", applyLegendPref);
+  if (Theme) Theme.onChange(applyLegendPref);
+  else window.addEventListener("storage", () => applyLegendPref());
 
   /* ------------------------------------------------------------------ */
   /* data flow                                                            */

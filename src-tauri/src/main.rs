@@ -36,6 +36,7 @@
 // evidence); hide it in release so the app behaves like a real tray utility.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appearance;
 mod autostart;
 mod login;
 mod png;
@@ -1789,7 +1790,9 @@ fn main() {
             hide_popover,
             quit,
             quit_app,
-            app_metadata
+            app_metadata,
+            appearance::get_appearance,
+            appearance::set_appearance
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1799,6 +1802,7 @@ fn main() {
             // the tray or the popover: the first fetch runs below, after the
             // window exists, and the UI gets the real payload from `get_report`.
             app.manage(AppState::new(settings.clone()));
+            app.manage(appearance::AppearanceState::load());
 
             install_trays(&handle)?;
 
