@@ -35,7 +35,6 @@
   const TAURI = window.__TAURI__ || null;
   const invoke = TAURI && TAURI.core ? TAURI.core.invoke : null;
   const F = window.CodexBarFormat;
-  const uiPrefs = F ? F.uiPrefs : { get: (_k, d) => d, set: () => {} };
 
   const STORAGE_KEY = "codexbar.settings.v1";
 
@@ -624,7 +623,6 @@
     paintSwitch("set-mergeIcons", settings.mergeIcons);
     paintSwitch("set-refreshCredentials", settings.refreshCredentials);
     paintSwitch("set-showPercentInIcon", settings.showPercentInIcon);
-    paintSwitch("set-showLegend", uiPrefs.get("showLegend", true));
 
     const interval = document.getElementById("set-refreshIntervalSecs");
     const wanted = String(settings.refreshIntervalSecs);
@@ -666,11 +664,6 @@
     bindSwitch("set-mergeIcons", (on) => patch({ mergeIcons: on }));
     bindSwitch("set-refreshCredentials", (on) => patch({ refreshCredentials: on }));
     bindSwitch("set-showPercentInIcon", (on) => patch({ showPercentInIcon: on }));
-
-    bindSwitch("set-showLegend", (on) => {
-      uiPrefs.set("showLegend", on);
-      renderBackendLine();
-    }, (on) => (on ? "The colour legend is shown above the command list." : "The colour legend is hidden."));
 
     const interval = document.getElementById("set-refreshIntervalSecs");
     interval.addEventListener("change", () => {
