@@ -17,7 +17,11 @@
 //!    on `userinfo` in the URL.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use codexbar_core::refresh::FailureClass;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,6 +35,18 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `User-Agent` sent when a provider does not set its own (mirrors the Swift
 /// `CodexBar/<version>` header so upstream logs line up).
 pub const USER_AGENT: &str = concat!("CodexBar/", env!("CARGO_PKG_VERSION"));
+
+/// TCP/TLS connect budget of the shared client. A dead host fails in seconds
+/// instead of eating the whole request timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Requests with a shorter timeout than this are best-effort probes and are not
+/// retried after a timeout.
+pub const MIN_RETRYABLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Upper bound for any single request on the shared client, whatever the
+/// request itself asks for (a provider's own `timeout()` is usually lower).
+pub const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Body size cap for error messages, per `SPEC-flagship.md` §9.8.
 const ERROR_BODY_CHARS: usize = 400;
@@ -219,6 +235,11 @@ impl HttpResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// `Retry-After`, as delta-seconds or an HTTP-date (RFC 7231 §7.1.3).
+    pub fn retry_after(&self) -> Option<Duration> {
+        parse_retry_after(self.header("Retry-After")?, chrono::Utc::now())
+    }
+
     /// Lossy UTF-8 view of the body (upstream error pages are not always UTF-8).
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
@@ -250,6 +271,8 @@ pub struct HttpError {
     pub message: String,
     /// Present for [`HttpErrorKind::Status`].
     pub status: Option<u16>,
+    /// Parsed `Retry-After` of a 429/503 response, when the server sent one.
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +310,7 @@ impl HttpError {
             kind,
             message: message.into(),
             status: None,
+            retry_after: None,
         }
     }
 
@@ -321,11 +345,47 @@ impl HttpError {
                 response.error_excerpt()
             ),
             status: Some(response.status),
+            retry_after: response.retry_after(),
         }
     }
 
     pub const fn status_code(&self) -> Option<u16> {
         self.status
+    }
+
+    /// Server-requested wait before the next attempt (`Retry-After` on a
+    /// 429/503), if any. The UI can turn this into "retry at HH:MM".
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    /// Coarse, user-actionable class of this error (shared with
+    /// `codexbar_core::refresh`).
+    pub fn class(&self) -> FailureClass {
+        match self.kind {
+            HttpErrorKind::Connect | HttpErrorKind::Client => FailureClass::Network,
+            HttpErrorKind::Timeout => FailureClass::Timeout,
+            HttpErrorKind::Decode | HttpErrorKind::InvalidRequest => FailureClass::Other,
+            HttpErrorKind::Status => match self.status {
+                Some(401) | Some(403) => FailureClass::Auth,
+                Some(429) => FailureClass::RateLimited,
+                Some(code) if (500..600).contains(&code) => FailureClass::Server,
+                // A `Status` error without a code is a provider-level mapping
+                // (e.g. DeepSeek's platform codes): classify its prose.
+                None => codexbar_core::refresh::classify_error(&self.message),
+                Some(_) => FailureClass::Other,
+            },
+        }
+    }
+
+    /// Credentials rejected — the user has to sign in again. Never retried.
+    pub fn is_auth(&self) -> bool {
+        self.class() == FailureClass::Auth
+    }
+
+    /// Worth retrying later (network, timeout, 5xx, 429).
+    pub fn is_transient(&self) -> bool {
+        self.class().is_transient()
     }
 }
 
@@ -360,9 +420,19 @@ pub struct ReqwestClient {
 }
 
 impl ReqwestClient {
+    /// One pooled client: connect + total timeouts, keep-alive, no redirects.
+    ///
+    /// TLS trusts both the bundled webpki roots and the Windows certificate
+    /// store (`rustls-tls-native-roots`), and the system proxy settings are
+    /// honoured (`system-proxy`), so a corporate proxy or a TLS-inspecting VPN
+    /// works like it does for the browser.
     pub fn new() -> Result<Self, HttpError> {
         let inner = reqwest::blocking::Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(MAX_REQUEST_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             // A redirect could carry the bearer to another host; providers that
             // legitimately redirect handle it themselves.
             .redirect(reqwest::redirect::Policy::none())
@@ -392,7 +462,7 @@ impl HttpClient for ReqwestClient {
         let mut builder = self
             .inner
             .request(method, &request.url)
-            .timeout(request.timeout);
+            .timeout(request.timeout.min(MAX_REQUEST_TIMEOUT));
 
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -402,6 +472,7 @@ impl HttpClient for ReqwestClient {
         }
 
         let response = builder.send().map_err(|e| {
+            NETWORK_FAILURES.fetch_add(1, Ordering::Relaxed);
             if e.is_timeout() {
                 HttpError::timeout(format!(
                     "{} timed out after {}s",
@@ -413,6 +484,7 @@ impl HttpClient for ReqwestClient {
             }
         })?;
 
+        RESPONSES.fetch_add(1, Ordering::Relaxed);
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -478,11 +550,265 @@ pub fn default_client() -> Box<dyn HttpClient> {
     }
 }
 
-/// Same as [`default_client`] but reusing one `reqwest` client (connection pool)
-/// across providers is not possible through a `dyn` box; kept explicit so the
-/// intent is obvious to the next worker.
-pub fn shared_client() -> std::sync::Arc<dyn HttpClient> {
-    std::sync::Arc::from(default_client())
+/// The process-wide client every production provider uses.
+///
+/// Built **once** (one connection pool, one TLS config) and wrapped in a
+/// [`RetryingClient`] with [`RetryPolicy::default`]. Every call returns the same
+/// `Arc`, so `live_registry()` and each provider's `new()` share the pool.
+pub fn shared_client() -> Arc<dyn HttpClient> {
+    static SHARED: OnceLock<Arc<dyn HttpClient>> = OnceLock::new();
+    Arc::clone(SHARED.get_or_init(|| {
+        let inner: Arc<dyn HttpClient> = Arc::from(default_client());
+        Arc::new(RetryingClient::new(inner, RetryPolicy::default()))
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Connectivity counters + offline hint
+// ---------------------------------------------------------------------------
+
+static RESPONSES: AtomicU64 = AtomicU64::new(0);
+static NETWORK_FAILURES: AtomicU64 = AtomicU64::new(0);
+static OFFLINE_HINT: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic transport counters of the real client ([`ReqwestClient`]).
+///
+/// Take one before and one after a refresh cycle; [`ConnectivityCounters::since`]
+/// gives the cycle's delta and [`ConnectivityCounters::looks_offline`] the verdict
+/// (network failures and not a single HTTP response of any status).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectivityCounters {
+    /// HTTP responses received (any status).
+    pub responses: u64,
+    /// Requests that failed before a response (connect / timeout / TLS).
+    pub network_failures: u64,
+}
+
+impl ConnectivityCounters {
+    pub fn since(self, earlier: ConnectivityCounters) -> ConnectivityCounters {
+        ConnectivityCounters {
+            responses: self.responses.saturating_sub(earlier.responses),
+            network_failures: self
+                .network_failures
+                .saturating_sub(earlier.network_failures),
+        }
+    }
+
+    pub const fn looks_offline(self) -> bool {
+        codexbar_core::refresh::looks_offline(self.responses, self.network_failures)
+    }
+}
+
+/// Current transport counters.
+pub fn connectivity() -> ConnectivityCounters {
+    ConnectivityCounters {
+        responses: RESPONSES.load(Ordering::Relaxed),
+        network_failures: NETWORK_FAILURES.load(Ordering::Relaxed),
+    }
+}
+
+/// Tell the retry layer the machine looked offline last cycle. While set,
+/// [`RetryingClient`] makes a single attempt per request (no retry loop against
+/// a dead network); the refresh loop clears it as soon as anything answers.
+pub fn set_offline_hint(offline: bool) {
+    OFFLINE_HINT.store(offline, Ordering::Relaxed);
+}
+
+pub fn offline_hint() -> bool {
+    OFFLINE_HINT.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Retry with exponential backoff + jitter
+// ---------------------------------------------------------------------------
+
+/// When and how long [`RetryingClient`] waits between attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Extra attempts after the first (0 = never retry).
+    pub max_retries: u32,
+    /// Delay before the first retry; doubles each time.
+    pub base_delay: Duration,
+    /// Cap for the computed backoff delay.
+    pub max_delay: Duration,
+    /// A `Retry-After` longer than this is not waited for: the error is
+    /// returned (with [`HttpError::retry_after`] set) and the next tick retries.
+    pub max_retry_after: Duration,
+    /// No new attempt starts once this much time has passed since the first
+    /// one, so retries stay inside the refresh pipeline's per-provider deadline.
+    pub max_elapsed: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            base_delay: Duration::from_millis(400),
+            max_delay: Duration::from_secs(4),
+            max_retry_after: Duration::from_secs(10),
+            max_elapsed: Duration::from_secs(25),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// No retries at all.
+    pub const fn none() -> Self {
+        Self {
+            max_retries: 0,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_retry_after: Duration::ZERO,
+            max_elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Backoff before retry number `attempt` (1-based), with "equal jitter":
+    /// half the exponential delay fixed, half random. `jitter` is in `[0, 1)`.
+    pub fn backoff(&self, attempt: u32, jitter: f64) -> Duration {
+        let exp = attempt.saturating_sub(1).min(16);
+        let full = self
+            .base_delay
+            .saturating_mul(1u32 << exp)
+            .min(self.max_delay);
+        let half = full / 2;
+        half + half.mul_f64(jitter.clamp(0.0, 1.0))
+    }
+}
+
+/// Why an attempt may (or may not) be retried.
+///
+/// Returns `None` for "do not retry", `Some(None)` for "retry after the
+/// computed backoff" and `Some(Some(wait))` for "retry after the server's
+/// `Retry-After`".
+///
+/// * **401 / 403 and every other 4xx: never.**
+/// * 429: only when the server sent a `Retry-After` we are willing to wait for
+///   (at most [`RetryPolicy::max_retry_after`]); a longer one is returned to the
+///   caller with [`HttpError::retry_after`] set.
+/// * `GET` / `PUT` / `DELETE` (idempotent): network failures, timeouts and
+///   500/502/503/504 are retried — except a timeout on a request shorter than
+///   [`MIN_RETRYABLE_TIMEOUT`], which marks a best-effort probe.
+/// * `POST`: only the 429 case above. A POST may already have been acted on
+///   (OAuth refresh tokens rotate, device-flow polls are rate-limited), so a
+///   blind replay could burn a credential.
+pub fn retry_decision(
+    request: &HttpRequest,
+    outcome: &Result<HttpResponse, HttpError>,
+    policy: &RetryPolicy,
+) -> Option<Option<Duration>> {
+    let idempotent = request.method != Method::Post;
+    match outcome {
+        Ok(response) => match response.status {
+            429 => match response.retry_after() {
+                Some(wait) if wait <= policy.max_retry_after => Some(Some(wait)),
+                _ => None,
+            },
+            500 | 502 | 503 | 504 if idempotent => match response.retry_after() {
+                Some(wait) if wait > policy.max_retry_after => None,
+                other => Some(other),
+            },
+            _ => None,
+        },
+        Err(err) if idempotent => match err.kind {
+            HttpErrorKind::Connect => Some(None),
+            HttpErrorKind::Timeout if request.timeout >= MIN_RETRYABLE_TIMEOUT => Some(None),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
+
+/// [`HttpClient`] decorator that retries transient failures with exponential
+/// backoff and jitter. See [`retry_decision`] for exactly what is retried.
+pub struct RetryingClient {
+    inner: Arc<dyn HttpClient>,
+    policy: RetryPolicy,
+    sleeper: Sleeper,
+}
+
+impl RetryingClient {
+    pub fn new(inner: Arc<dyn HttpClient>, policy: RetryPolicy) -> Self {
+        Self {
+            inner,
+            policy,
+            sleeper: Arc::new(std::thread::sleep),
+        }
+    }
+
+    /// Replace the sleep function (tests record the waits instead of sleeping).
+    pub fn with_sleeper(mut self, sleeper: impl Fn(Duration) + Send + Sync + 'static) -> Self {
+        self.sleeper = Arc::new(sleeper);
+        self
+    }
+
+    pub fn policy(&self) -> RetryPolicy {
+        self.policy
+    }
+}
+
+impl fmt::Debug for RetryingClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryingClient")
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl HttpClient for RetryingClient {
+    fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let max_retries = if offline_hint() {
+            0
+        } else {
+            self.policy.max_retries
+        };
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
+        loop {
+            let outcome = self.inner.execute(request);
+            if attempt >= max_retries {
+                return outcome;
+            }
+            let Some(server_wait) = retry_decision(request, &outcome, &self.policy) else {
+                return outcome;
+            };
+            attempt += 1;
+            let wait = server_wait.unwrap_or_else(|| self.policy.backoff(attempt, jitter()));
+            if started.elapsed() + wait >= self.policy.max_elapsed {
+                return outcome;
+            }
+            (self.sleeper)(wait);
+        }
+    }
+}
+
+/// Cheap `[0, 1)` jitter without a RNG dependency (splitmix64 over the clock
+/// and a counter). Not cryptographic; it only has to de-synchronise retries.
+fn jitter() -> f64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut z = nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Parse a `Retry-After` value: delta-seconds (`120`) or an HTTP-date
+/// (`Wed, 21 Oct 2015 07:28:00 GMT`). A date in the past is `0 s`.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = when.with_timezone(&chrono::Utc) - now;
+    Some(delta.to_std().unwrap_or(Duration::ZERO))
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +1008,259 @@ mod tests {
             .execute(&HttpRequest::get("https://example.com"))
             .unwrap_err();
         assert_eq!(err.kind, HttpErrorKind::Client);
+    }
+
+    // ---- retry / backoff ---------------------------------------------------
+
+    use crate::testing::{FixtureClient, FixtureResponse};
+    use std::sync::Mutex;
+
+    fn retrying(
+        script: Vec<FixtureResponse>,
+    ) -> (
+        RetryingClient,
+        Arc<FixtureClient>,
+        Arc<Mutex<Vec<Duration>>>,
+    ) {
+        let fixture = Arc::new(FixtureClient::new(script));
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&waits);
+        let client = RetryingClient::new(
+            Arc::clone(&fixture) as Arc<dyn HttpClient>,
+            RetryPolicy::default(),
+        )
+        .with_sleeper(move |d| recorder.lock().unwrap().push(d));
+        (client, fixture, waits)
+    }
+
+    #[test]
+    fn retries_503_then_succeeds() {
+        let (client, fixture, waits) = retrying(vec![
+            FixtureResponse::text(503, "maintenance"),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        let response = client
+            .send_ok(&HttpRequest::get("https://example.com/usage"))
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(fixture.request_count(), 2);
+        let waits = waits.lock().unwrap();
+        assert_eq!(waits.len(), 1);
+        let policy = RetryPolicy::default();
+        assert!(waits[0] >= policy.base_delay / 2 && waits[0] <= policy.base_delay);
+    }
+
+    #[test]
+    fn retries_connect_errors_up_to_the_limit() {
+        let (client, fixture, waits) = retrying(vec![
+            FixtureResponse::failure(HttpErrorKind::Connect, "refused"),
+            FixtureResponse::failure(HttpErrorKind::Connect, "refused"),
+            FixtureResponse::failure(HttpErrorKind::Connect, "refused"),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        let err = client
+            .execute(&HttpRequest::get("https://example.com"))
+            .unwrap_err();
+        assert_eq!(err.kind, HttpErrorKind::Connect);
+        assert_eq!(fixture.request_count(), 3, "1 attempt + 2 retries");
+        assert_eq!(waits.lock().unwrap().len(), 2);
+        assert!(!fixture.exhausted());
+    }
+
+    #[test]
+    fn never_retries_401_or_403() {
+        for status in [401, 403] {
+            let (client, fixture, waits) = retrying(vec![
+                FixtureResponse::text(status, "nope"),
+                FixtureResponse::json(200, "{}"),
+            ]);
+            let err = client
+                .send_ok(&HttpRequest::get("https://example.com"))
+                .unwrap_err();
+            assert_eq!(err.status_code(), Some(status));
+            assert!(err.is_auth());
+            assert!(!err.is_transient());
+            assert_eq!(
+                fixture.request_count(),
+                1,
+                "HTTP {status} must not be retried"
+            );
+            assert!(waits.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn respects_retry_after_on_429() {
+        let (client, fixture, waits) = retrying(vec![
+            FixtureResponse::with_headers(429, "slow down", &[("Retry-After", "3")]),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        client
+            .send_ok(&HttpRequest::get("https://example.com"))
+            .unwrap();
+        assert_eq!(fixture.request_count(), 2);
+        assert_eq!(*waits.lock().unwrap(), vec![Duration::from_secs(3)]);
+    }
+
+    #[test]
+    fn does_not_wait_out_a_long_retry_after_and_exposes_it() {
+        let (client, fixture, waits) = retrying(vec![FixtureResponse::with_headers(
+            429,
+            "quota",
+            &[("Retry-After", "600")],
+        )]);
+        let err = client
+            .send_ok(&HttpRequest::get("https://example.com"))
+            .unwrap_err();
+        assert_eq!(fixture.request_count(), 1);
+        assert!(waits.lock().unwrap().is_empty());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(600)));
+        assert_eq!(err.class(), FailureClass::RateLimited);
+    }
+
+    #[test]
+    fn plain_429_without_retry_after_is_not_retried() {
+        let (client, fixture, _) = retrying(vec![
+            FixtureResponse::text(429, "slow down"),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        assert!(client
+            .send_ok(&HttpRequest::get("https://example.com"))
+            .is_err());
+        assert_eq!(fixture.request_count(), 1);
+    }
+
+    #[test]
+    fn post_is_not_replayed_on_5xx_or_connect_errors() {
+        for script in [
+            vec![
+                FixtureResponse::text(503, "busy"),
+                FixtureResponse::json(200, "{}"),
+            ],
+            vec![
+                FixtureResponse::connect_error(),
+                FixtureResponse::json(200, "{}"),
+            ],
+        ] {
+            let (client, fixture, _) = retrying(script);
+            assert!(client
+                .send_ok(&HttpRequest::post("https://example.com/token"))
+                .is_err());
+            assert_eq!(fixture.request_count(), 1);
+        }
+    }
+
+    #[test]
+    fn timed_out_post_is_not_retried() {
+        let (client, fixture, _) = retrying(vec![
+            FixtureResponse::timeout(),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        let err = client
+            .execute(&HttpRequest::post("https://example.com/token"))
+            .unwrap_err();
+        assert_eq!(err.kind, HttpErrorKind::Timeout);
+        assert_eq!(fixture.request_count(), 1);
+    }
+
+    #[test]
+    fn short_best_effort_probe_is_not_retried_on_timeout() {
+        let (client, fixture, _) = retrying(vec![
+            FixtureResponse::timeout(),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        let probe = HttpRequest::get("https://example.com/key").timeout(Duration::from_secs(1));
+        assert!(client.execute(&probe).is_err());
+        assert_eq!(fixture.request_count(), 1);
+
+        let (client, fixture, _) = retrying(vec![
+            FixtureResponse::timeout(),
+            FixtureResponse::json(200, "{}"),
+        ]);
+        assert!(client
+            .execute(&HttpRequest::get("https://example.com/usage"))
+            .is_ok());
+        assert_eq!(fixture.request_count(), 2);
+    }
+
+    #[test]
+    fn backoff_is_exponential_capped_and_jittered() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(1000),
+            max_retry_after: Duration::from_secs(1),
+            max_elapsed: Duration::from_secs(60),
+        };
+        assert_eq!(policy.backoff(1, 0.0), Duration::from_millis(50));
+        assert_eq!(policy.backoff(1, 1.0), Duration::from_millis(100));
+        assert_eq!(policy.backoff(2, 1.0), Duration::from_millis(200));
+        assert_eq!(policy.backoff(3, 1.0), Duration::from_millis(400));
+        assert_eq!(policy.backoff(9, 1.0), Duration::from_millis(1000));
+        for _ in 0..100 {
+            let j = jitter();
+            assert!((0.0..1.0).contains(&j));
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2015-10-21T07:27:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            parse_retry_after(" 120 ", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT", now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn shared_client_is_one_instance() {
+        let a = shared_client();
+        let b = shared_client();
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn error_classes() {
+        let req = HttpRequest::get("https://example.com");
+        let class_of =
+            |status: u16| HttpError::status(&req, &HttpResponse::new(status, "")).class();
+        assert_eq!(class_of(401), FailureClass::Auth);
+        assert_eq!(class_of(403), FailureClass::Auth);
+        assert_eq!(class_of(429), FailureClass::RateLimited);
+        assert_eq!(class_of(502), FailureClass::Server);
+        assert_eq!(class_of(404), FailureClass::Other);
+        assert_eq!(HttpError::connect("x").class(), FailureClass::Network);
+        assert_eq!(HttpError::timeout("x").class(), FailureClass::Timeout);
+        assert_eq!(HttpError::decode("x").class(), FailureClass::Other);
+    }
+
+    #[test]
+    fn connectivity_delta_and_offline_verdict() {
+        let before = ConnectivityCounters {
+            responses: 10,
+            network_failures: 2,
+        };
+        let offline = ConnectivityCounters {
+            responses: 10,
+            network_failures: 7,
+        };
+        assert!(offline.since(before).looks_offline());
+        let online = ConnectivityCounters {
+            responses: 11,
+            network_failures: 7,
+        };
+        assert!(!online.since(before).looks_offline());
     }
 
     #[test]

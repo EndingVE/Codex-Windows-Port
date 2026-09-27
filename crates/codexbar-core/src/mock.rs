@@ -106,6 +106,16 @@ pub fn mock_registry() -> Vec<Box<dyn Provider>> {
         .collect()
 }
 
+/// [`mock_registry`] as shared providers, for
+/// [`crate::refresh::collect_with`] (which can abandon a wedged fetch and so
+/// needs `Arc` rather than borrowed providers).
+pub fn mock_registry_shared() -> Vec<std::sync::Arc<dyn Provider>> {
+    ProviderId::ALL
+        .into_iter()
+        .map(|id| std::sync::Arc::new(MockProvider::new(id)) as std::sync::Arc<dyn Provider>)
+        .collect()
+}
+
 fn hourly_seed(now: DateTime<Utc>) -> f64 {
     // Stable within a minute bucket: screenshots taken back-to-back match.
     ((now.timestamp() / 60) % 360) as f64
@@ -437,6 +447,25 @@ mod tests {
     fn report_covers_every_provider_in_canonical_order() {
         let report = mock_report(Utc::now());
         let ids: Vec<ProviderId> = report.providers.iter().map(|p| p.provider).collect();
+        assert_eq!(ids, ProviderId::ALL.to_vec());
+    }
+
+    /// `collect` fetches in parallel now; the report must still come back in
+    /// canonical order and identical to the sequential mock report.
+    #[test]
+    fn parallel_collect_matches_the_sequential_report() {
+        for limit in [1, 3, 64] {
+            let report = crate::types::collect_parallel(&mock_registry(), limit);
+            let ids: Vec<ProviderId> = report.providers.iter().map(|p| p.provider).collect();
+            assert_eq!(ids, ProviderId::ALL.to_vec(), "limit {limit}");
+        }
+        let shared = crate::refresh::collect_with(
+            &mock_registry_shared(),
+            crate::refresh::CollectOptions::default(),
+            Utc::now(),
+            &|_| None,
+        );
+        let ids: Vec<ProviderId> = shared.report.providers.iter().map(|p| p.provider).collect();
         assert_eq!(ids, ProviderId::ALL.to_vec());
     }
 

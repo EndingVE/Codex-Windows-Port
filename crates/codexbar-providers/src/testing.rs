@@ -39,6 +39,12 @@ pub enum FixtureResponse {
         kind: HttpErrorKind,
         message: String,
     },
+    /// A body with explicit response headers (`Retry-After`, …).
+    WithHeaders {
+        status: u16,
+        body: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 impl FixtureResponse {
@@ -63,6 +69,24 @@ impl FixtureResponse {
         }
     }
 
+    /// A response carrying extra headers, e.g. a 429 with `Retry-After`.
+    pub fn with_headers(status: u16, body: impl Into<String>, headers: &[(&str, &str)]) -> Self {
+        FixtureResponse::WithHeaders {
+            status,
+            body: body.into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// A network-level failure (DNS, refused, TLS) — what an offline machine
+    /// produces.
+    pub fn connect_error() -> Self {
+        Self::failure(HttpErrorKind::Connect, "could not be reached (fixture)")
+    }
+
     /// A request that exceeded its deadline — the OpenRouter `/key` degradation
     /// path is exercised with this.
     pub fn timeout() -> Self {
@@ -77,6 +101,14 @@ impl From<FixtureResponse> for HttpResponse {
                 HttpResponse::new(status, body.into_bytes())
                     .with_header("Content-Type", "application/json")
             }
+            FixtureResponse::WithHeaders {
+                status,
+                body,
+                headers,
+            } => headers.into_iter().fold(
+                HttpResponse::new(status, body.into_bytes()),
+                |response, (name, value)| response.with_header(name, value),
+            ),
             FixtureResponse::Failure { .. } => HttpResponse::new(0, Vec::new()),
         }
     }
