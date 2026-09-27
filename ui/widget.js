@@ -17,7 +17,28 @@
  *   ?theme=light|dark   pin the fallback palette
  *   ?stale=1            age the mock report to show the stale banner
  */
-(function () {
+/**
+ * Compact countdown for the narrow reset column: at most two units, and a
+ * unit that is zero is dropped ("3d", not "3d 0h"; "2h", not "2h 0m").
+ * Pure and DOM-free so `node --test ui/widget.test.js` can exercise it.
+ */
+function widgetDuration(ms) {
+  const secs = Math.max(0, Math.round(Number(ms) / 1000) || 0);
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const minutes = Math.floor((secs % 3600) / 60);
+  const join = (a, ua, b, ub) => (b > 0 ? a + ua + " " + b + ub : a + ua);
+  if (days > 0) return join(days, "d", hours, "h");
+  if (hours > 0) return join(hours, "h", minutes, "m");
+  if (minutes > 0) return minutes + "m";
+  return secs + "s";
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { widgetDuration };
+}
+
+if (typeof document !== "undefined") (function () {
   "use strict";
 
   const TAURI = window.__TAURI__ || null;
@@ -100,24 +121,28 @@
     if (!win) return "";
     if (win.resetsAt) {
       const left = Date.parse(win.resetsAt) - now;
-      if (left > 0) return F.humanize(left);
+      if (left > 0) return widgetDuration(left);
       return "due";
     }
     return "";
   }
 
+  /** Provider mark on a uniform light chip (see widget.css `.widget-chip`):
+   *  the SVGs keep their own colours, so full-bleed tiles (codex, zai) and
+   *  near-black marks (cursor, copilot) all read in both themes. */
   function iconFor(snapshot) {
+    const chip = document.createElement("span");
+    chip.className = "widget-chip";
     const img = document.createElement("img");
     img.className = "widget-icon";
     img.alt = "";
     img.src = "assets/" + snapshot.provider + ".svg";
     img.addEventListener("error", () => {
-      const span = document.createElement("span");
-      span.className = "widget-icon-fallback";
-      span.textContent = (snapshot.title || snapshot.provider || "?").charAt(0).toUpperCase();
-      img.replaceWith(span);
+      chip.classList.add("is-fallback");
+      chip.textContent = (snapshot.title || snapshot.provider || "?").charAt(0).toUpperCase();
     });
-    return img;
+    chip.appendChild(img);
+    return chip;
   }
 
   function cell(cls, text) {
