@@ -12,15 +12,24 @@
 //! 3. [`read_json`] / path helpers — read-only file access with the Windows path
 //!    conventions from `SPEC-flagship.md` §1.2 and §7.
 //!
-//! Nothing in this module ever writes. The single exception in the whole crate is
-//! [`crate::oauth::write_json_atomic`], which is used only by an explicit,
-//! user-initiated OAuth refresh and keeps a `.bak` copy.
+//! 4. [`SecretBackend`] — the vault for CodexBar's **own** secrets (API keys
+//!    typed into its config, the Copilot device-flow token). The production
+//!    backend is Windows Credential Manager with a DPAPI-encrypted file as the
+//!    fallback ([`default_vault`]); `config.json` only keeps a
+//!    `{"$vault": "<key>"}` reference. Credentials that belong to *other* CLIs
+//!    (Codex, Claude, Cursor, Gemini, …) are never copied into it.
+//!
+//! Nothing in this module writes another tool's files. The vault backends write
+//! only CodexBar's own Credential Manager entries and its own
+//! `%LOCALAPPDATA%\CodexBar\secrets.dpapi`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use codexbar_core::ProviderId;
+use zeroize::Zeroize;
 
 /// A credential value that refuses to print itself.
 ///
@@ -77,10 +86,18 @@ impl fmt::Display for Secret {
     }
 }
 
+/// The buffer is wiped when the value is dropped (RECON D10), so a refreshed
+/// token or a key read from the vault does not linger in freed heap memory.
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl From<Secret> for String {
     /// Explicit, named conversion — an audit point.
-    fn from(value: Secret) -> Self {
-        value.0
+    fn from(mut value: Secret) -> Self {
+        std::mem::take(&mut value.0)
     }
 }
 
@@ -396,10 +413,24 @@ pub fn xdg_data_home(env: &Env) -> Option<PathBuf> {
 /// `%APPDATA%\CodexBar\config.json`, overridable with `CODEXBAR_CONFIG`.
 /// The port never rewrites the config files of other tools, and it only ever
 /// *reads* this one during a fetch.
-#[derive(Debug, Clone)]
+///
+/// A secret field may hold either a plain string (a config that predates the
+/// vault) or a `{"$vault": "<key>"}` reference, which is resolved through the
+/// attached [`SecretBackend`] only when the value is actually needed.
+#[derive(Clone)]
 pub struct PortConfig {
     root: serde_json::Value,
     path: PathBuf,
+    vault: Option<Arc<dyn SecretBackend>>,
+}
+
+impl fmt::Debug for PortConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortConfig")
+            .field("path", &self.path)
+            .field("vault", &self.vault.as_ref().map(|v| v.name()))
+            .finish()
+    }
 }
 
 impl PortConfig {
@@ -418,10 +449,31 @@ impl PortConfig {
             return Ok(None);
         };
         match read_json(&path) {
-            Ok(root) => Ok(Some(Self { root, path })),
+            Ok(root) => Ok(Some(Self {
+                root,
+                path,
+                vault: Some(default_vault()),
+            })),
             Err(CredentialError::Missing(_)) => Ok(None),
             Err(other) => Err(other),
         }
+    }
+
+    /// Resolve `{"$vault": …}` references through `vault` instead of the
+    /// production store. Tests inject a [`MemoryBackend`] here.
+    pub fn with_vault(mut self, vault: Arc<dyn SecretBackend>) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    /// A string value, or the secret a vault reference points at.
+    fn resolve_value(&self, value: &serde_json::Value) -> Option<String> {
+        if let Some(text) = value.as_str() {
+            return cleaned(text);
+        }
+        let key = vault_ref_key(value)?;
+        let secret = self.vault.as_ref()?.get(key).ok().flatten()?;
+        cleaned(secret.expose())
     }
 
     /// The entry for `providers[].id == id`, if the config lists it.
@@ -437,8 +489,7 @@ impl PortConfig {
     pub fn api_key(&self, id: ProviderId) -> Option<Secret> {
         self.entry(id)
             .and_then(|p| p.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .and_then(cleaned)
+            .and_then(|v| self.resolve_value(v))
             .map(Secret::new)
     }
 
@@ -450,13 +501,11 @@ impl PortConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
         let accounts = accounts.get("accounts")?.as_array()?;
-        accounts
+        let token = accounts
             .get(index)
             .or_else(|| accounts.first())?
-            .get("token")
-            .and_then(|v| v.as_str())
-            .and_then(cleaned)
-            .map(Secret::new)
+            .get("token")?;
+        self.resolve_value(token).map(Secret::new)
     }
 
     /// Auxiliary string fields: `workspaceID`, `region`, `cookieHeader`,
@@ -464,8 +513,7 @@ impl PortConfig {
     pub fn field(&self, id: ProviderId, field: &str) -> Option<String> {
         self.entry(id)?
             .get(field)
-            .and_then(|v| v.as_str())
-            .and_then(cleaned)
+            .and_then(|v| self.resolve_value(v))
     }
 
     /// Resolved credential for an API-key provider, honouring the port's
@@ -481,6 +529,471 @@ impl PortConfig {
 
     pub fn source_path(&self) -> &Path {
         &self.path
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault for CodexBar's own secrets (RECON D4)
+// ---------------------------------------------------------------------------
+
+/// JSON key that marks a vault reference inside `config.json`:
+/// `{"$vault": "openrouter.apiKey", "hint": "9f2c"}`.
+pub const VAULT_REF_KEY: &str = "$vault";
+/// Optional last-four hint stored next to a reference, so the settings window
+/// can show `••••9f2c` without reading the secret back.
+pub const VAULT_HINT_KEY: &str = "hint";
+/// Target-name prefix of every Credential Manager entry CodexBar owns.
+pub const CREDENTIAL_TARGET_PREFIX: &str = "CodexBar/";
+
+/// The vault key a reference points at, if `value` is a reference.
+pub fn vault_ref_key(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get(VAULT_REF_KEY)
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// Build a reference object for `key`, remembering the last four characters.
+pub fn vault_ref(key: &str, secret: &Secret) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        VAULT_REF_KEY.to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+    if secret.expose().chars().count() > 8 {
+        map.insert(
+            VAULT_HINT_KEY.to_string(),
+            serde_json::Value::String(secret.suffix(4)),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+/// A place to keep CodexBar's own secrets. Implementations must never write a
+/// value in plain text and never put one in an error message.
+pub trait SecretBackend: Send + Sync {
+    /// Short name for diagnostics (`credential-manager`, `dpapi-file`, …).
+    fn name(&self) -> &'static str;
+    /// `Ok(None)` when the key is not stored.
+    fn get(&self, key: &str) -> Result<Option<Secret>, String>;
+    fn set(&self, key: &str, value: &Secret) -> Result<(), String>;
+    /// Deleting a key that does not exist is not an error.
+    fn delete(&self, key: &str) -> Result<(), String>;
+}
+
+/// In-memory vault. Used by tests (and on non-Windows hosts, where secrets
+/// then simply do not persist — never a plain-text file).
+#[derive(Default)]
+pub struct MemoryBackend {
+    values: Mutex<BTreeMap<String, Secret>>,
+}
+
+impl MemoryBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stored keys, for assertions. Never values.
+    pub fn keys(&self) -> Vec<String> {
+        self.values
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+impl SecretBackend for MemoryBackend {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+    fn get(&self, key: &str) -> Result<Option<Secret>, String> {
+        Ok(self
+            .values
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned())
+    }
+    fn set(&self, key: &str, value: &Secret) -> Result<(), String> {
+        self.values
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string(), value.clone());
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> Result<(), String> {
+        self.values
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
+        Ok(())
+    }
+}
+
+/// Try `primary` (Credential Manager) and fall back to `fallback` (the DPAPI
+/// file) when it fails. Reads consult both, so a value that once had to take
+/// the fallback path is still found.
+pub struct FallbackBackend {
+    primary: Arc<dyn SecretBackend>,
+    fallback: Arc<dyn SecretBackend>,
+}
+
+impl FallbackBackend {
+    pub fn new(primary: Arc<dyn SecretBackend>, fallback: Arc<dyn SecretBackend>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl SecretBackend for FallbackBackend {
+    fn name(&self) -> &'static str {
+        self.primary.name()
+    }
+    fn get(&self, key: &str) -> Result<Option<Secret>, String> {
+        match self.primary.get(key) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => self.fallback.get(key),
+            Err(primary) => self
+                .fallback
+                .get(key)
+                .map_err(|fallback| format!("{primary}; {fallback}")),
+        }
+    }
+    fn set(&self, key: &str, value: &Secret) -> Result<(), String> {
+        match self.primary.set(key, value) {
+            Ok(()) => {
+                // A stale copy in the fallback would shadow nothing (primary is
+                // read first) but must not linger either.
+                let _ = self.fallback.delete(key);
+                Ok(())
+            }
+            Err(primary) => {
+                eprintln!(
+                    "codexbar: {} unavailable for {key} ({primary}); using {}",
+                    self.primary.name(),
+                    self.fallback.name()
+                );
+                self.fallback
+                    .set(key, value)
+                    .map_err(|fallback| format!("{primary}; {fallback}"))
+            }
+        }
+    }
+    fn delete(&self, key: &str) -> Result<(), String> {
+        let a = self.primary.delete(key);
+        let b = self.fallback.delete(key);
+        a.and(b)
+    }
+}
+
+/// The production vault: Credential Manager, then the DPAPI file.
+///
+/// On non-Windows hosts (the crate is portable for tests and tooling) this is
+/// an in-memory store — never a plain-text file.
+pub fn default_vault() -> Arc<dyn SecretBackend> {
+    static VAULT: OnceLock<Arc<dyn SecretBackend>> = OnceLock::new();
+    Arc::clone(VAULT.get_or_init(build_default_vault))
+}
+
+#[cfg(windows)]
+fn build_default_vault() -> Arc<dyn SecretBackend> {
+    let dpapi_path = local_appdata_dir()
+        .or_else(appdata_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("CodexBar")
+        .join("secrets.dpapi");
+    Arc::new(FallbackBackend::new(
+        Arc::new(win_vault::CredentialManagerBackend::new(
+            CREDENTIAL_TARGET_PREFIX,
+        )),
+        Arc::new(win_vault::DpapiFileBackend::new(dpapi_path)),
+    ))
+}
+
+#[cfg(not(windows))]
+fn build_default_vault() -> Arc<dyn SecretBackend> {
+    Arc::new(MemoryBackend::new())
+}
+
+#[cfg(windows)]
+pub use win_vault::{CredentialManagerBackend, DpapiFileBackend};
+
+/// Windows implementations: `CredReadW`/`CredWriteW`/`CredDeleteW` and
+/// `CryptProtectData`/`CryptUnprotectData` from `windows-sys`.
+#[cfg(windows)]
+mod win_vault {
+    use super::{Secret, SecretBackend};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_NOT_FOUND};
+    use windows_sys::Win32::Security::Credentials::{
+        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    use zeroize::Zeroize;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Generic credentials under `<prefix><key>`, persisted per machine (not
+    /// roamed with the profile, unlike `%APPDATA%`).
+    pub struct CredentialManagerBackend {
+        prefix: String,
+    }
+
+    impl CredentialManagerBackend {
+        pub fn new(prefix: &str) -> Self {
+            Self {
+                prefix: prefix.to_string(),
+            }
+        }
+
+        fn target(&self, key: &str) -> Vec<u16> {
+            wide(&format!("{}{key}", self.prefix))
+        }
+    }
+
+    impl SecretBackend for CredentialManagerBackend {
+        fn name(&self) -> &'static str {
+            "credential-manager"
+        }
+
+        fn get(&self, key: &str) -> Result<Option<Secret>, String> {
+            let target = self.target(key);
+            let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
+            // SAFETY: `target` is NUL-terminated and outlives the call; on
+            // success `cred` points at a buffer we free with `CredFree`.
+            let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
+            if ok == 0 {
+                // SAFETY: plain FFI call with no arguments.
+                let err = unsafe { GetLastError() };
+                if err == ERROR_NOT_FOUND {
+                    return Ok(None);
+                }
+                return Err(format!("CredReadW failed (error {err})"));
+            }
+            // SAFETY: `cred` is valid until `CredFree`; the blob is
+            // `CredentialBlobSize` bytes long.
+            let value = unsafe {
+                let c = &*cred;
+                let bytes = if c.CredentialBlob.is_null() || c.CredentialBlobSize == 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize)
+                        .to_vec()
+                };
+                CredFree(cred as *const _);
+                bytes
+            };
+            let mut value = value;
+            let text = String::from_utf8(value.clone());
+            value.zeroize();
+            match text {
+                Ok(text) => Ok(Some(Secret::new(text))),
+                Err(_) => Err("stored credential is not UTF-8".to_string()),
+            }
+        }
+
+        fn set(&self, key: &str, value: &Secret) -> Result<(), String> {
+            let mut blob = value.expose().as_bytes().to_vec();
+            if blob.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
+                blob.zeroize();
+                return Err("value too large for Credential Manager".to_string());
+            }
+            let mut target = self.target(key);
+            let mut user = wide("CodexBar");
+            let cred = CREDENTIALW {
+                Type: CRED_TYPE_GENERIC,
+                TargetName: target.as_mut_ptr(),
+                CredentialBlobSize: blob.len() as u32,
+                CredentialBlob: blob.as_mut_ptr(),
+                Persist: CRED_PERSIST_LOCAL_MACHINE,
+                UserName: user.as_mut_ptr(),
+                ..Default::default()
+            };
+            // SAFETY: every pointer in `cred` points into a live local buffer.
+            let ok = unsafe { CredWriteW(&cred, 0) };
+            // SAFETY: plain FFI call.
+            let err = if ok == 0 {
+                unsafe { GetLastError() }
+            } else {
+                0
+            };
+            blob.zeroize();
+            if ok == 0 {
+                return Err(format!("CredWriteW failed (error {err})"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> Result<(), String> {
+            let target = self.target(key);
+            // SAFETY: NUL-terminated target that outlives the call.
+            let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+            if ok == 0 {
+                // SAFETY: plain FFI call.
+                let err = unsafe { GetLastError() };
+                if err != ERROR_NOT_FOUND {
+                    return Err(format!("CredDeleteW failed (error {err})"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// DPAPI (`CryptProtectData`, current-user scope) over a single file that
+    /// holds a JSON map of every fallback secret. The plain JSON only ever
+    /// exists in memory.
+    pub struct DpapiFileBackend {
+        path: PathBuf,
+        lock: Mutex<()>,
+    }
+
+    impl DpapiFileBackend {
+        pub fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                lock: Mutex::new(()),
+            }
+        }
+
+        fn read_map(&self) -> Result<BTreeMap<String, String>, String> {
+            let sealed = match std::fs::read(&self.path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+                Err(e) => return Err(format!("could not read the DPAPI store: {e}")),
+            };
+            let mut plain = unprotect(&sealed)?;
+            let map = serde_json::from_slice(&plain)
+                .map_err(|_| "the DPAPI store is not valid".to_string());
+            plain.zeroize();
+            map
+        }
+
+        fn write_map(&self, map: &BTreeMap<String, String>) -> Result<(), String> {
+            let mut plain = serde_json::to_vec(map).map_err(|e| e.to_string())?;
+            let sealed = protect(&plain);
+            plain.zeroize();
+            let sealed = sealed?;
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            }
+            let mut tmp = self.path.clone().into_os_string();
+            tmp.push(format!(".tmp{}", std::process::id()));
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, &sealed).map_err(|e| format!("DPAPI store write: {e}"))?;
+            std::fs::rename(&tmp, &self.path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("DPAPI store replace: {e}")
+            })
+        }
+    }
+
+    impl SecretBackend for DpapiFileBackend {
+        fn name(&self) -> &'static str {
+            "dpapi-file"
+        }
+        fn get(&self, key: &str) -> Result<Option<Secret>, String> {
+            let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = self.read_map()?;
+            let found = map.remove(key).map(Secret::new);
+            for value in map.values_mut() {
+                value.zeroize();
+            }
+            Ok(found)
+        }
+        fn set(&self, key: &str, value: &Secret) -> Result<(), String> {
+            let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = self.read_map()?;
+            map.insert(key.to_string(), value.expose().to_string());
+            let result = self.write_map(&map);
+            for value in map.values_mut() {
+                value.zeroize();
+            }
+            result
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = self.read_map()?;
+            let result = if map.remove(key).is_some() {
+                self.write_map(&map)
+            } else {
+                Ok(())
+            };
+            for value in map.values_mut() {
+                value.zeroize();
+            }
+            result
+        }
+    }
+
+    fn protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+        crypt(plain, true)
+    }
+
+    fn unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
+        crypt(sealed, false)
+    }
+
+    fn crypt(input: &[u8], seal: bool) -> Result<Vec<u8>, String> {
+        let data_in = CRYPT_INTEGER_BLOB {
+            cbData: input.len() as u32,
+            pbData: input.as_ptr() as *mut u8,
+        };
+        let mut data_out = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: `data_in` borrows `input` for the duration of the call; on
+        // success `data_out` is a LocalAlloc'd buffer we copy and free.
+        let ok = unsafe {
+            if seal {
+                CryptProtectData(
+                    &data_in,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut data_out,
+                )
+            } else {
+                CryptUnprotectData(
+                    &data_in,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut data_out,
+                )
+            }
+        };
+        if ok == 0 {
+            // SAFETY: plain FFI call.
+            let err = unsafe { GetLastError() };
+            return Err(format!(
+                "{} failed (error {err})",
+                if seal {
+                    "CryptProtectData"
+                } else {
+                    "CryptUnprotectData"
+                }
+            ));
+        }
+        // SAFETY: DPAPI returned `cbData` valid bytes at `pbData`.
+        let out = unsafe {
+            let bytes =
+                std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec();
+            std::ptr::write_bytes(data_out.pbData, 0, data_out.cbData as usize);
+            LocalFree(data_out.pbData as _);
+            bytes
+        };
+        Ok(out)
     }
 }
 
@@ -630,5 +1143,128 @@ mod tests {
                 .to_string(),
         );
         assert!(PortConfig::load(&env).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_secret_moved_into_a_string_keeps_its_value() {
+        let secret = Secret::new("value-to-move");
+        let text: String = secret.into();
+        assert_eq!(text, "value-to-move");
+    }
+
+    #[test]
+    fn vault_references_resolve_through_the_injected_backend() {
+        let dir = std::env::temp_dir().join(format!("codexbar-cfg-vault-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let secret = Secret::new("sk-or-vault-value-1234");
+        let reference = vault_ref("openrouter.apiKey", &secret);
+        assert_eq!(reference["hint"], "1234");
+        let root = serde_json::json!({"providers":[
+            {"id":"openrouter","apiKey": reference},
+            {"id":"copilot","tokenAccounts":{"activeIndex":0,"accounts":[
+                {"token":{"$vault":"copilot.tokenAccounts.0"},"label":"x"}]}}
+        ]});
+        std::fs::write(&path, serde_json::to_vec(&root).unwrap()).unwrap();
+        let vault = Arc::new(MemoryBackend::new());
+        vault.set("openrouter.apiKey", &secret).unwrap();
+        vault
+            .set("copilot.tokenAccounts.0", &Secret::new("gho_vault_token"))
+            .unwrap();
+
+        let env = Env::empty().with("CODEXBAR_CONFIG", path.to_string_lossy().to_string());
+        let config = PortConfig::load(&env)
+            .unwrap()
+            .unwrap()
+            .with_vault(vault.clone());
+        assert_eq!(
+            config.api_key(ProviderId::OpenRouter).unwrap().expose(),
+            "sk-or-vault-value-1234"
+        );
+        assert_eq!(
+            config
+                .active_token_account(ProviderId::Copilot)
+                .unwrap()
+                .expose(),
+            "gho_vault_token"
+        );
+        // A dangling reference is simply "not configured".
+        vault.delete("openrouter.apiKey").unwrap();
+        assert!(config.api_key(ProviderId::OpenRouter).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct Broken;
+    impl SecretBackend for Broken {
+        fn name(&self) -> &'static str {
+            "broken"
+        }
+        fn get(&self, _: &str) -> Result<Option<Secret>, String> {
+            Err("down".into())
+        }
+        fn set(&self, _: &str, _: &Secret) -> Result<(), String> {
+            Err("down".into())
+        }
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Err("down".into())
+        }
+    }
+
+    #[test]
+    fn the_fallback_backend_takes_over_when_the_primary_fails() {
+        let fallback = Arc::new(MemoryBackend::new());
+        let vault = FallbackBackend::new(Arc::new(Broken), fallback.clone());
+        vault.set("k", &Secret::new("v-123456789")).unwrap();
+        assert_eq!(fallback.keys(), vec!["k".to_string()]);
+        assert_eq!(vault.get("k").unwrap().unwrap().expose(), "v-123456789");
+
+        // A healthy primary wins and clears the fallback copy.
+        let primary = Arc::new(MemoryBackend::new());
+        let vault = FallbackBackend::new(primary.clone(), fallback.clone());
+        vault.set("k", &Secret::new("fresh-value")).unwrap();
+        assert!(fallback.keys().is_empty());
+        assert_eq!(primary.keys(), vec!["k".to_string()]);
+    }
+
+    /// Real Windows APIs, but only under a test-only target prefix / temp file:
+    /// the user's own CodexBar entries are never read or written.
+    #[cfg(windows)]
+    #[test]
+    fn credential_manager_round_trips_under_a_test_prefix() {
+        let prefix = format!("CodexBar-test-{}/", std::process::id());
+        let vault = CredentialManagerBackend::new(&prefix);
+        let key = "unit.roundtrip";
+        vault.delete(key).unwrap();
+        assert!(vault.get(key).unwrap().is_none());
+        vault
+            .set(key, &Secret::new("fixture-secret-value"))
+            .unwrap();
+        assert_eq!(
+            vault.get(key).unwrap().unwrap().expose(),
+            "fixture-secret-value"
+        );
+        vault.delete(key).unwrap();
+        assert!(vault.get(key).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_dpapi_file_is_never_plain_text() {
+        let dir = std::env::temp_dir().join(format!("codexbar-dpapi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secrets.dpapi");
+        let vault = DpapiFileBackend::new(path.clone());
+        vault
+            .set("a.apiKey", &Secret::new("dpapi-fixture-secret"))
+            .unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("dpapi-fixture-secret"));
+        assert_eq!(
+            vault.get("a.apiKey").unwrap().unwrap().expose(),
+            "dpapi-fixture-secret"
+        );
+        vault.delete("a.apiKey").unwrap();
+        assert!(vault.get("a.apiKey").unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

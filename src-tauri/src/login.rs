@@ -250,8 +250,9 @@ pub fn poll(flow: &DeviceFlow, code: &DeviceCode, store_path: Option<&Path>) -> 
                         status: "authorized".to_string(),
                         stored: true,
                         message: format!(
-                            "Signed in. GitHub issued a token and it was saved to {}{} — \
-                             Copilot will use it on the next refresh.",
+                            "Signed in. GitHub issued a token; it is kept in Windows \
+                             Credential Manager and referenced from {}{} — Copilot will \
+                             use it on the next refresh.",
                             stored.path,
                             if stored.replaced {
                                 " (replacing the previous sign-in)"
@@ -415,7 +416,10 @@ mod tests {
         // …but the provider can now read it back.
         let env = codexbar_providers::Env::empty()
             .with("CODEXBAR_CONFIG", path.to_string_lossy().to_string());
-        let config = codexbar_providers::PortConfig::load(&env).unwrap().unwrap();
+        let config = codexbar_providers::PortConfig::load(&env)
+            .unwrap()
+            .unwrap()
+            .with_vault(crate::secret_store::vault_for(&path));
         assert_eq!(
             config
                 .resolve_api_key(ProviderId::Copilot, &env, &["COPILOT_API_TOKEN"])

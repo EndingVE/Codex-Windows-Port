@@ -41,6 +41,7 @@ mod login;
 mod png;
 mod reauth;
 mod registry;
+mod secret_store;
 mod settings;
 mod settings_window;
 mod token_store;
@@ -270,7 +271,7 @@ fn refresh_status(state: tauri::State<'_, AppState>) -> Option<RefreshStatus> {
 /// Current settings (camelCase JSON, as persisted).
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
-    state.settings()
+    state.settings().for_webview()
 }
 
 /// Factory defaults, for the settings window's "Restore defaults" button.
@@ -438,6 +439,9 @@ fn copilot_login_poll(state: tauri::State<'_, AppState>) -> Result<login::LoginP
     };
     let path = token_store::config_path();
     let result = login::poll(&DeviceFlow::new(), &code, Some(&path));
+    if result.status == "authorized" {
+        state.set_settings(settings::load());
+    }
     if matches!(
         result.status.as_str(),
         "authorized" | "expired" | "denied" | "failed"
@@ -1126,7 +1130,7 @@ fn mutate_settings(app: &AppHandle, mutate: impl FnOnce(&mut Settings)) {
     let mut next = state.settings();
     mutate(&mut next);
     let next = next.normalized();
-    if let Err(err) = settings::save(&next) {
+    if let Err(err) = settings::save_merged(&next) {
         eprintln!("codexbar: could not save settings: {err}");
     }
     state.set_settings(next.clone());
@@ -1148,7 +1152,7 @@ fn apply_settings(app: &AppHandle, incoming: Settings) -> Result<Settings, Strin
     if next == app.state::<AppState>().settings() {
         return Ok(next);
     }
-    let path = settings::save(&next)?;
+    let path = settings::save_merged(&next)?;
     app.state::<AppState>().set_settings(next.clone());
     app.state::<AppState>()
         .request_refresh(RefreshRequest::SettingsChanged);

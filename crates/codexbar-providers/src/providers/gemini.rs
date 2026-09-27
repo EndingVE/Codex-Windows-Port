@@ -14,8 +14,13 @@
 //!   and `:loadCodeAssist`.
 //!
 //! The port never writes: a token that has expired is refreshed **in memory**
-//! through [`crate::oauth::refresh`] and used for this fetch only, exactly
-//! because a background tick must not overwrite another tool's credential file.
+//! through [`crate::oauth::refresh`], exactly because a background tick must not
+//! overwrite another tool's credential file. The refreshed access token is kept
+//! in a process-wide [`TokenCache`] until a minute before it expires (RECON D6),
+//! so consecutive ticks reuse it instead of posting the refresh grant each time.
+//! A refresh rejected with `invalid_grant` / 401 becomes a clear
+//! *re-authentication needed* state (and is remembered, so a dead grant is not
+//! re-posted every tick) instead of a generic error.
 //!
 //! ## Consumer-tier shutdown (2026-06-18)
 //!
@@ -39,7 +44,7 @@ use serde_json::{json, Value};
 
 use crate::credential::{cleaned, display_path, home_dir, read_json, Env, PortConfig, Secret};
 use crate::http::{HttpClient, HttpRequest};
-use crate::oauth::{refresh, RefreshRequest};
+use crate::oauth::{refresh, shared_token_cache, CachedToken, RefreshRequest, TokenCache};
 
 /// Client id override.
 pub const ENV_CLIENT_ID: &str = "GEMINI_OAUTH_CLIENT_ID";
@@ -72,6 +77,7 @@ pub struct Gemini {
     client: Arc<dyn HttpClient>,
     env: Env,
     config: Option<PortConfig>,
+    token_cache: Arc<TokenCache>,
 }
 
 impl Gemini {
@@ -82,15 +88,25 @@ impl Gemini {
             client: crate::http::shared_client(),
             env,
             config,
+            token_cache: shared_token_cache(),
         }
     }
 
+    /// Uses the process-wide token cache: the live registry is rebuilt every
+    /// tick, so only a shared cache survives from one fetch to the next.
     pub fn with_client(client: Arc<dyn HttpClient>, env: Env) -> Self {
         Self {
             client,
             env,
             config: None,
+            token_cache: shared_token_cache(),
         }
+    }
+
+    /// Inject a private cache (tests; embedders that want isolation).
+    pub fn with_token_cache(mut self, cache: Arc<TokenCache>) -> Self {
+        self.token_cache = cache;
+        self
     }
 
     pub fn with_config(mut self, config: Option<PortConfig>) -> Self {
@@ -576,6 +592,11 @@ impl Provider for Gemini {
         let quotas = match self.user_quota(&access_token, project_id.as_deref()) {
             Ok(quotas) => quotas,
             Err(FetchFailure::NotConfigured(message)) => {
+                // A cached token the API no longer accepts must not be reused.
+                if let Some(refresh_token) = creds.refresh_token.as_deref() {
+                    self.token_cache
+                        .invalidate(&TokenCache::key("gemini", &Secret::new(refresh_token)));
+                }
                 snapshot.status = FetchStatus::NotConfigured;
                 snapshot.error = Some(message);
                 return snapshot;
@@ -652,11 +673,30 @@ impl Gemini {
             ));
         };
 
-        let request = RefreshRequest::new(TOKEN_URL, client.client_id, Secret::new(refresh_token))
+        let refresh_token = Secret::new(refresh_token);
+        let cache_key = TokenCache::key("gemini", &refresh_token);
+        match self.token_cache.get(&cache_key, now) {
+            Some(CachedToken::Fresh(token)) => return Ok(token),
+            Some(CachedToken::Rejected(message)) => {
+                return Err(FetchFailure::NotConfigured(message))
+            }
+            None => {}
+        }
+
+        let request = RefreshRequest::new(TOKEN_URL, client.client_id, refresh_token)
             .with_client_secret(Secret::new(client.client_secret));
-        let refreshed = refresh(self.client.as_ref(), &request, now)
-            .map_err(|err| FetchFailure::Error(err.user_message()))?;
-        Ok(refreshed.access_token)
+        match refresh(self.client.as_ref(), &request, now) {
+            Ok(refreshed) => {
+                self.token_cache.store(&cache_key, &refreshed, now);
+                Ok(refreshed.access_token)
+            }
+            Err(err) if err.needs_reauth() => {
+                let message = reauth_message();
+                self.token_cache.mark_rejected(&cache_key, message.clone());
+                Err(FetchFailure::NotConfigured(message))
+            }
+            Err(err) => Err(FetchFailure::Error(err.user_message())),
+        }
     }
 
     fn load_code_assist(
@@ -821,6 +861,14 @@ fn deprecation_message() -> String {
          Ultra accounts on 2026-06-18. Switch to the Antigravity provider, or use a Workspace / \
          Code Assist Standard account."
     )
+}
+
+/// The re-authentication state shown when Google rejects the refresh grant.
+/// Worded so the UI's token-expired classifier recognises it.
+pub fn reauth_message() -> String {
+    "Re-authentication needed: Google rejected the Gemini refresh token (expired or revoked) \
+     — run `gemini` again to sign in."
+        .to_string()
 }
 
 /// Why a step failed, before it becomes a `FetchStatus`.
