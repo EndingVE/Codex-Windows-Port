@@ -35,7 +35,6 @@
   const TAURI = window.__TAURI__ || null;
   const invoke = TAURI && TAURI.core ? TAURI.core.invoke : null;
   const F = window.CodexBarFormat;
-  const uiPrefs = F ? F.uiPrefs : { get: (_k, d) => d, set: () => {} };
 
   const STORAGE_KEY = "codexbar.settings.v1";
 
@@ -110,7 +109,11 @@
       const id = typeof entry === "string" ? entry : entry && entry.id;
       if (!known.has(id) || seen.has(id)) return;
       seen.add(id);
-      providers.push({ id, enabled: entry.enabled !== false });
+      // Keep the entry's other fields (e.g. `{hasKey, masked}` placeholders the
+      // backend sends instead of secrets). The backend merges every save with
+      // what is on disk, so a field left out here never deletes a stored key.
+      const rest = entry && typeof entry === "object" ? entry : {};
+      providers.push(Object.assign({}, rest, { id, enabled: rest.enabled !== false }));
     });
     // Any provider the backend did not mention still shows up, so a new build
     // cannot hide its own providers behind an old settings file.
@@ -154,12 +157,31 @@
 
   /** Persist. With a backend this is authoritative; localStorage is always
    *  mirrored so a browser-only session still remembers what was set. */
+  /** Secret fields never travel back as placeholders: a masked or empty
+   *  value is dropped, which the backend reads as "unchanged". */
+  const SECRET_FIELDS = ["apiKey", "cookieHeader", "token"];
+  function withoutSecretPlaceholders(value) {
+    const providers = (value.providers || []).map((entry) => {
+      const out = Object.assign({}, entry);
+      SECRET_FIELDS.forEach((field) => {
+        const v = out[field];
+        if (v === undefined || v === null) return;
+        if (typeof v !== "string" || !v.trim() || v.startsWith("•")) delete out[field];
+      });
+      delete out.tokenAccounts;
+      return out;
+    });
+    return Object.assign({}, value, { providers });
+  }
+
   async function save(next) {
     settings = normalize(next);
     localWrite();
     if (invoke) {
       try {
-        const echo = await invoke("set_settings", { settings });
+        const echo = await invoke("set_settings", {
+          settings: withoutSecretPlaceholders(settings),
+        });
         if (echo) settings = normalize(echo);
       } catch (err) {
         console.warn("CodexBar: set_settings failed, kept the local copy", err);
@@ -601,7 +623,6 @@
     paintSwitch("set-mergeIcons", settings.mergeIcons);
     paintSwitch("set-refreshCredentials", settings.refreshCredentials);
     paintSwitch("set-showPercentInIcon", settings.showPercentInIcon);
-    paintSwitch("set-showLegend", uiPrefs.get("showLegend", true));
 
     const interval = document.getElementById("set-refreshIntervalSecs");
     const wanted = String(settings.refreshIntervalSecs);
@@ -643,11 +664,6 @@
     bindSwitch("set-mergeIcons", (on) => patch({ mergeIcons: on }));
     bindSwitch("set-refreshCredentials", (on) => patch({ refreshCredentials: on }));
     bindSwitch("set-showPercentInIcon", (on) => patch({ showPercentInIcon: on }));
-
-    bindSwitch("set-showLegend", (on) => {
-      uiPrefs.set("showLegend", on);
-      renderBackendLine();
-    }, (on) => (on ? "The colour legend is shown above the command list." : "The colour legend is hidden."));
 
     const interval = document.getElementById("set-refreshIntervalSecs");
     interval.addEventListener("change", () => {

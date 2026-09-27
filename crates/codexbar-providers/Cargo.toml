@@ -17,6 +17,20 @@ reqwest = { workspace = true }
 # `bundled` compiles SQLite from source so the port has no system-wide dependency
 # and the version is pinned in Cargo.lock.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Wipes a `Secret`'s buffer when it is dropped (RECON D10).
+zeroize = "1"
+
+# CodexBar's *own* secrets live in Windows Credential Manager (`CredWriteW`)
+# with a DPAPI (`CryptProtectData`) file fallback. `windows-sys` is already in
+# the dependency graph (via tauri/reqwest), so this adds no new crate — only
+# the three API families below.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+] }
 
 [dev-dependencies]
 # Integration tests build a throwaway fixture database in a temp dir; the crate

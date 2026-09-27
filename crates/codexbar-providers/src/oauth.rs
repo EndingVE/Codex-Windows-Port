@@ -12,11 +12,20 @@
 //!   half-written credential behind.
 //!
 //! Everything else in the crate is read-only. Keep it that way.
+//!
+//! [`TokenCache`] keeps a refreshed access token **in memory** until shortly
+//! before it expires (RECON D6), so a provider that reads another CLI's expired
+//! session does not hit the token endpoint on every tick. Nothing it holds is
+//! ever written to disk: the owning CLI's credential file stays untouched.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -99,6 +108,22 @@ pub enum OAuthError {
 }
 
 impl OAuthError {
+    /// `true` when the refresh token itself is dead (revoked, expired, wrong
+    /// client) — retrying cannot help and the user must sign in again with the
+    /// CLI that owns the session. Transport failures are *not* re-auth cases.
+    pub fn needs_reauth(&self) -> bool {
+        match self {
+            OAuthError::Rejected { code, .. } => {
+                let code = code.to_ascii_lowercase();
+                matches!(
+                    code.as_str(),
+                    "invalid_grant" | "unauthorized_client" | "invalid_client" | "http401"
+                ) || code.contains("401")
+            }
+            _ => false,
+        }
+    }
+
     /// Short, actionable text with no secret material in it.
     pub fn user_message(&self) -> String {
         match self {
@@ -215,6 +240,128 @@ pub fn refresh(
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+// ---------------------------------------------------------------------------
+// In-memory access-token cache (RECON D6)
+// ---------------------------------------------------------------------------
+
+/// Safety margin: a cached token is not handed out in its last minute.
+pub const TOKEN_CACHE_SKEW: ChronoDuration = ChronoDuration::seconds(60);
+/// Lifetime assumed when the token endpoint omits `expires_in`.
+pub const TOKEN_CACHE_DEFAULT_TTL: ChronoDuration = ChronoDuration::minutes(5);
+
+enum CacheEntry {
+    Token {
+        access_token: Secret,
+        expires_at: DateTime<Utc>,
+    },
+    /// The refresh token was rejected (`invalid_grant`, 401, …). Remembered so
+    /// the tick does not keep posting a dead grant; a new sign-in changes the
+    /// refresh token and therefore the cache key.
+    Rejected(String),
+}
+
+/// What a cache lookup found.
+#[derive(Debug, Clone)]
+pub enum CachedToken {
+    Fresh(Secret),
+    /// The last refresh with this grant needed re-authentication; carries the
+    /// user-facing message.
+    Rejected(String),
+}
+
+/// Process-wide cache of refreshed access tokens, keyed by provider + a hash
+/// of the refresh token (the refresh token itself is never stored).
+#[derive(Default)]
+pub struct TokenCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl fmt::Debug for TokenCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TokenCache(<redacted>)")
+    }
+}
+
+impl TokenCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cache key: `<provider>:<hash(refresh_token)>`.
+    pub fn key(provider: &str, refresh_token: &Secret) -> String {
+        let mut hasher = DefaultHasher::new();
+        refresh_token.expose().hash(&mut hasher);
+        format!("{provider}:{:016x}", hasher.finish())
+    }
+
+    /// A still-valid token (outside [`TOKEN_CACHE_SKEW`] of expiry), or a
+    /// remembered rejection.
+    pub fn get(&self, key: &str, now: DateTime<Utc>) -> Option<CachedToken> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        match entries.get(key) {
+            Some(CacheEntry::Token {
+                access_token,
+                expires_at,
+            }) => {
+                if *expires_at > now + TOKEN_CACHE_SKEW {
+                    Some(CachedToken::Fresh(access_token.clone()))
+                } else {
+                    entries.remove(key);
+                    None
+                }
+            }
+            Some(CacheEntry::Rejected(message)) => Some(CachedToken::Rejected(message.clone())),
+            None => None,
+        }
+    }
+
+    /// Remember a successful refresh.
+    pub fn store(&self, key: &str, token: &RefreshedToken, now: DateTime<Utc>) {
+        let expires_at = token.expires_at.unwrap_or(now + TOKEN_CACHE_DEFAULT_TTL);
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                key.to_string(),
+                CacheEntry::Token {
+                    access_token: token.access_token.clone(),
+                    expires_at,
+                },
+            );
+    }
+
+    /// Remember that this grant needs re-authentication.
+    pub fn mark_rejected(&self, key: &str, message: impl Into<String>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string(), CacheEntry::Rejected(message.into()));
+    }
+
+    /// Drop an entry — e.g. the API answered 401 to a cached token.
+    pub fn invalidate(&self, key: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The cache every production provider shares (the registry is rebuilt on each
+/// tick, so a per-instance cache would never be hit).
+pub fn shared_token_cache() -> Arc<TokenCache> {
+    static CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
+    Arc::clone(CACHE.get_or_init(|| Arc::new(TokenCache::new())))
 }
 
 /// Atomically write `value` as JSON to `path`, keeping the previous contents at
@@ -405,5 +552,53 @@ mod tests {
         assert!(backup.is_none());
         assert!(path.is_file());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reauth_is_detected_for_dead_grants_only() {
+        let rejected = |code: &str| OAuthError::Rejected {
+            code: code.into(),
+            message: "m".into(),
+        };
+        assert!(rejected("invalid_grant").needs_reauth());
+        assert!(rejected("http401").needs_reauth());
+        assert!(rejected("unauthorized_client").needs_reauth());
+        assert!(!rejected("temporarily_unavailable").needs_reauth());
+        assert!(!OAuthError::Transport("timeout".into()).needs_reauth());
+    }
+
+    #[test]
+    fn the_token_cache_serves_until_the_skew_then_expires() {
+        let now = Utc::now();
+        let cache = TokenCache::new();
+        let key = TokenCache::key("gemini", &Secret::new("refresh-a"));
+        assert_ne!(key, TokenCache::key("gemini", &Secret::new("refresh-b")));
+        assert!(!key.contains("refresh-a"));
+        let token = RefreshedToken {
+            access_token: Secret::new("cached-access"),
+            refresh_token: None,
+            expires_at: Some(now + ChronoDuration::minutes(10)),
+            token_type: None,
+            scope: None,
+        };
+        cache.store(&key, &token, now);
+        match cache.get(&key, now + ChronoDuration::minutes(5)) {
+            Some(CachedToken::Fresh(t)) => assert_eq!(t.expose(), "cached-access"),
+            other => panic!("expected a fresh token, got {other:?}"),
+        }
+        // Inside the last minute the token is no longer handed out.
+        assert!(cache
+            .get(&key, now + ChronoDuration::seconds(550))
+            .is_none());
+        assert!(cache.is_empty());
+
+        cache.mark_rejected(&key, "sign in again");
+        assert!(matches!(
+            cache.get(&key, now),
+            Some(CachedToken::Rejected(_))
+        ));
+        cache.invalidate(&key);
+        assert!(cache.get(&key, now).is_none());
+        assert!(!format!("{cache:?}").contains("cached-access"));
     }
 }

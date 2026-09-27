@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use codexbar_core::{DataSource, FetchStatus, Provider, ProviderId, WindowKind};
+use codexbar_providers::oauth::TokenCache;
 use codexbar_providers::testing::{FixtureClient, FixtureResponse};
 use codexbar_providers::{Env, Gemini, HttpClient};
 
@@ -100,8 +101,11 @@ fn env_for(creds: &Path, settings: &Path) -> Env {
         .with("GEMINI_OAUTH_CLIENT_SECRET", "fixture-client-secret")
 }
 
+/// Every test gets a private token cache, so parallel tests that share a
+/// fixture refresh token cannot see each other's cached access tokens.
 fn provider(client: &Arc<FixtureClient>, env: Env) -> Gemini {
     Gemini::with_client(Arc::clone(client) as Arc<dyn HttpClient>, env)
+        .with_token_cache(Arc::new(TokenCache::new()))
 }
 
 #[test]
@@ -438,4 +442,85 @@ fn fetch_uses_the_supplied_now_for_fetched_at() {
     let instant = now();
     let snapshot = provider(&client, env_for(&creds, &settings)).fetch(instant);
     assert_eq!(snapshot.fetched_at, instant);
+}
+
+/// RECON D6: the refreshed access token is cached in memory until it expires,
+/// so two fetches with an expired on-disk token make exactly **one** refresh
+/// POST — and the second one reuses the cached token for its API calls.
+#[test]
+fn a_refreshed_token_is_reused_from_the_cache_until_it_expires() {
+    let scratch = Scratch::new("cache");
+    let creds_path = scratch.write("oauth_creds.json", CREDS_EXPIRED);
+    let settings = scratch.write("settings.json", SETTINGS_OAUTH);
+    let before = std::fs::read(&creds_path).unwrap();
+
+    let client = fixture(vec![
+        FixtureResponse::json(200, REFRESH),
+        FixtureResponse::json(200, LOAD_CODE_ASSIST),
+        FixtureResponse::json(200, QUOTA),
+        FixtureResponse::json(200, LOAD_CODE_ASSIST),
+        FixtureResponse::json(200, QUOTA),
+        // Only reached once the cached token has expired (third fetch).
+        FixtureResponse::json(200, REFRESH),
+        FixtureResponse::json(200, LOAD_CODE_ASSIST),
+        FixtureResponse::json(200, QUOTA),
+    ]);
+    let cache = Arc::new(TokenCache::new());
+    let gemini = Gemini::with_client(
+        Arc::clone(&client) as Arc<dyn HttpClient>,
+        env_for(&creds_path, &settings),
+    )
+    .with_token_cache(Arc::clone(&cache));
+
+    let first = gemini.fetch(now());
+    assert_eq!(first.status, FetchStatus::Ok, "{:?}", first.error);
+    let second = gemini.fetch(now() + chrono::Duration::minutes(10));
+    assert_eq!(second.status, FetchStatus::Ok, "{:?}", second.error);
+
+    let refreshes = |c: &FixtureClient| {
+        c.captured()
+            .iter()
+            .filter(|r| r.url.contains("oauth2.googleapis.com/token"))
+            .count()
+    };
+    assert_eq!(client.request_count(), 5);
+    assert_eq!(refreshes(&client), 1, "the second fetch must hit the cache");
+    // The cached token is the one used on the second fetch's API calls.
+    assert!(client.captured()[3].sends_authorization_with("Bearer "));
+
+    // `expires_in` is 3600 s: past it (minus the 60 s skew) a new refresh runs.
+    let third = gemini.fetch(now() + chrono::Duration::minutes(59) + chrono::Duration::seconds(30));
+    assert_eq!(third.status, FetchStatus::Ok, "{:?}", third.error);
+    assert_eq!(refreshes(&client), 2);
+
+    // Still read-only: the CLI's credential file is untouched.
+    assert_eq!(std::fs::read(&creds_path).unwrap(), before);
+}
+
+/// A dead refresh token (`invalid_grant`) is a clear re-authentication state,
+/// not a generic error, and is not re-posted on the next tick.
+#[test]
+fn an_invalid_grant_is_a_reauth_state_and_is_not_retried_every_tick() {
+    let scratch = Scratch::new("invalid-grant");
+    let creds_path = scratch.write("oauth_creds.json", CREDS_EXPIRED);
+    let settings = scratch.write("settings.json", SETTINGS_OAUTH);
+    let client = fixture(vec![FixtureResponse::json(
+        400,
+        r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+    )]);
+    let gemini = provider(&client, env_for(&creds_path, &settings));
+
+    let snapshot = gemini.fetch(now());
+    assert_eq!(snapshot.status, FetchStatus::NotConfigured);
+    let error = snapshot.error.unwrap_or_default();
+    assert!(error.starts_with("Re-authentication needed"), "{error}");
+    assert!(error.contains("gemini"));
+
+    let again = gemini.fetch(now() + chrono::Duration::minutes(1));
+    assert_eq!(again.status, FetchStatus::NotConfigured);
+    assert_eq!(
+        client.request_count(),
+        1,
+        "a dead grant is posted only once"
+    );
 }

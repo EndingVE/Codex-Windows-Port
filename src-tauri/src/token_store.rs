@@ -14,13 +14,19 @@
 //! ```json
 //! { "providers": [ { "id": "copilot", "enabled": true,
 //!   "tokenAccounts": { "activeIndex": 0,
-//!     "accounts": [ { "token": "<issued>", "label": "GitHub device flow (Copilot)" } ] } } ] }
+//!     "accounts": [ { "token": { "$vault": "copilot.tokenAccounts.0", "hint": "9f2c" },
+//!                     "label": "GitHub device flow (Copilot)" } ] } } ] }
 //! ```
 //!
+//! The token itself lives in Windows Credential Manager (DPAPI file fallback),
+//! see `secret_store.rs`; the provider resolves the reference.
+//!
 //! **Rules this module keeps:**
-//!  * the token is written **only** through
+//!  * the whole read-modify-write runs under the config lock shared with every
+//!    settings save (RECON D3), and the file is replaced only through
 //!    [`codexbar_providers::write_json_atomic`] (temp file + rename, with a
-//!    `.bak` of the previous contents) — a crash can never truncate the config;
+//!    `.bak` of the previous contents, which holds references only) — a crash
+//!    can never truncate the config;
 //!  * the whole file is read-modify-written as raw JSON, so a provider entry's
 //!    `apiKey`, a hand-edited `providers` order, unknown top-level keys and the
 //!    rest of the config are preserved byte-for-byte apart from the one field we
@@ -32,6 +38,7 @@
 
 use std::path::{Path, PathBuf};
 
+use codexbar_providers::credential::SecretBackend;
 use codexbar_providers::{write_json_atomic, Secret};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -70,11 +77,31 @@ pub fn store_device_token(
     token: &Secret,
     label: &str,
 ) -> Result<StoredToken, String> {
+    let vault = crate::secret_store::vault_for(path);
+    store_device_token_in(path, provider, token, label, vault.as_ref())
+}
+
+/// [`store_device_token`] with an explicit vault (tests inject one).
+///
+/// The token goes to the vault; `config.json` gets only a `{"$vault": …}`
+/// reference. The whole read-modify-write runs under
+/// [`crate::secret_store::config_lock`], the lock every settings save takes,
+/// so a tray save racing the login can neither drop nor resurrect it.
+pub fn store_device_token_in(
+    path: &Path,
+    provider: &str,
+    token: &Secret,
+    label: &str,
+    vault: &dyn SecretBackend,
+) -> Result<StoredToken, String> {
     let cleaned = token.expose().trim();
     if cleaned.is_empty() {
         return Err("refusing to store an empty credential".to_string());
     }
 
+    let _guard = crate::secret_store::config_lock();
+    // An older build's plain secrets move to the vault before we touch the file.
+    crate::secret_store::migrate_config_file_locked(path, vault)?;
     let mut root = read_root(path)?;
     let object = root
         .as_object_mut()
@@ -111,8 +138,13 @@ pub fn store_device_token(
         .and_then(Value::as_array)
         .is_some_and(|accounts| !accounts.is_empty());
 
+    let reference = crate::secret_store::put(
+        vault,
+        &crate::secret_store::account_key(provider, 0),
+        &Secret::new(cleaned),
+    )?;
     let mut account = Map::new();
-    account.insert("token".to_string(), Value::String(cleaned.to_string()));
+    account.insert("token".to_string(), reference);
     account.insert("label".to_string(), Value::String(label.to_string()));
 
     let mut accounts = Map::new();
@@ -123,6 +155,8 @@ pub fn store_device_token(
     );
     entry.insert(TOKEN_ACCOUNTS_FIELD.to_string(), Value::Object(accounts));
 
+    // After the migration above the previous revision holds only vault
+    // references, so the `.bak` this keeps carries no secret.
     write_json_atomic(path, &root)
         .map_err(|e| format!("could not write the credential to {}: {e}", path.display()))?;
 
@@ -189,7 +223,10 @@ mod tests {
         assert!(!stored.replaced);
 
         let env = Env::empty().with("CODEXBAR_CONFIG", path.to_string_lossy().to_string());
-        let config = PortConfig::load(&env).unwrap().unwrap();
+        let config = PortConfig::load(&env)
+            .unwrap()
+            .unwrap()
+            .with_vault(crate::secret_store::vault_for(&path));
         assert_eq!(
             config
                 .resolve_api_key(ProviderId::Copilot, &env, &["COPILOT_API_TOKEN"])
@@ -218,7 +255,10 @@ mod tests {
         store_device_token(&path, "copilot", &Secret::new(TOKEN), "lbl").unwrap();
 
         let env = Env::empty().with("CODEXBAR_CONFIG", path.to_string_lossy().to_string());
-        let config = PortConfig::load(&env).unwrap().unwrap();
+        let config = PortConfig::load(&env)
+            .unwrap()
+            .unwrap()
+            .with_vault(crate::secret_store::vault_for(&path));
         assert_eq!(
             config.api_key(ProviderId::OpenRouter).unwrap().expose(),
             "sk-or-v1-keepme"
@@ -257,7 +297,16 @@ mod tests {
             .unwrap();
         let accounts = entry["tokenAccounts"]["accounts"].as_array().unwrap();
         assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0]["token"], "second-token-value");
+        assert_eq!(accounts[0]["token"]["$vault"], "copilot.tokenAccounts.0");
+        let vault = crate::secret_store::vault_for(&path);
+        assert_eq!(
+            vault
+                .get("copilot.tokenAccounts.0")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "second-token-value"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -296,10 +345,20 @@ mod tests {
         assert!(!rendered.contains("fixture_device_flow"));
         assert!(rendered.contains("gho_fi…oken") || rendered.contains('…'));
 
-        // The on-disk file does contain it (that is the point), but nothing the
-        // module returns does.
+        // The on-disk file holds only a vault reference (RECON D4); the token
+        // itself is in the vault.
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(on_disk.contains(TOKEN));
+        assert!(!on_disk.contains(TOKEN));
+        assert!(on_disk.contains("\"$vault\""));
+        let vault = crate::secret_store::vault_for(&path);
+        assert_eq!(
+            vault
+                .get("copilot.tokenAccounts.0")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            TOKEN
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -355,7 +414,10 @@ mod tests {
         // the usage API and maps the fixture onto windows.
         store_device_token(&path, "copilot", &Secret::new(TOKEN), "lbl").unwrap();
         let env = Env::empty().with("CODEXBAR_CONFIG", path.to_string_lossy().to_string());
-        let config = PortConfig::load(&env).unwrap().unwrap();
+        let config = PortConfig::load(&env)
+            .unwrap()
+            .unwrap()
+            .with_vault(crate::secret_store::vault_for(&path));
         let after = Copilot::with_client(Arc::clone(&client) as Arc<dyn HttpClient>, env.clone())
             .with_config(Some(config))
             .fetch(now);
