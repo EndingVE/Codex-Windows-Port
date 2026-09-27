@@ -47,6 +47,7 @@ mod settings;
 mod settings_window;
 mod token_store;
 mod tray_icon;
+mod widget;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -838,6 +839,7 @@ fn build_menu(
         display.append(&selector)?;
     }
     menu.append(&display)?;
+    menu.append(&widget::submenu(app)?)?;
 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(
@@ -876,6 +878,10 @@ fn handle_menu(app: &AppHandle, id: &str) {
         }
         "settings" => settings_window::open(app),
         "quit" => app.exit(0),
+        other if other.starts_with(widget::MENU_PREFIX) => {
+            widget::handle_menu(app, other);
+            sync_trays(app);
+        }
         "tray:merge" => mutate_settings(app, |s| s.merge_icons = !s.merge_icons),
         "tray:percent" => {
             mutate_settings(app, |s| s.show_percent_in_icon = !s.show_percent_in_icon)
@@ -1400,6 +1406,7 @@ fn apply_refresh_on_main_thread(app: &AppHandle, report: Arc<UsageReport>, statu
             // Expected while the webview has not finished loading yet.
             eprintln!("codexbar: could not notify UI: {err}");
         }
+        let _ = handle.emit_to(widget::WIDGET, "usage-updated", &*report);
         let _ = handle.emit_to(POPOVER, "refresh-status", &status);
         let _ = handle.emit_to(settings_window::SETTINGS_WINDOW, "refresh-status", &status);
     });
@@ -1760,6 +1767,9 @@ fn main() {
     let settings_builtin = args.iter().any(|arg| arg == "--settings-builtin");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            widget::focus_existing(app, &args)
+        }))
         .register_uri_scheme_protocol(
             settings_window::SETTINGS_SCHEME,
             settings_window::protocol_response,
@@ -1792,7 +1802,11 @@ fn main() {
             quit_app,
             app_metadata,
             appearance::get_appearance,
-            appearance::set_appearance
+            appearance::set_appearance,
+            widget::toggle_widget,
+            widget::widget_state,
+            widget::widget_update,
+            widget::widget_drag
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1804,6 +1818,7 @@ fn main() {
             app.manage(AppState::new(settings.clone()));
             app.manage(appearance::AppearanceState::load());
 
+            widget::restore(&handle);
             install_trays(&handle)?;
 
             // Make the Run key agree with the persisted setting (idempotent).

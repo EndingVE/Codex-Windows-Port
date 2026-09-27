@@ -8,6 +8,13 @@
 //! Windows, keeps the crate graph unchanged, and is trivial to audit in the
 //! evidence scripts. Every call is spawned with `CREATE_NO_WINDOW` so the tray
 //! app never flashes a console.
+//!
+//! The floating widget needs no extra Run argument: `widget.rs` restores its
+//! visibility, position and modes from `widget.json` on every start, so a
+//! login start brings the widget back exactly as the user left it. A
+//! hand-written entry may still append `--widget` to force it visible; the
+//! reconcile pass below compares only the executable path, so such arguments
+//! are preserved instead of being "repaired" away on every start.
 
 use std::process::Command;
 
@@ -113,7 +120,7 @@ pub fn reconcile(desired: bool) {
     };
     let current = registered_command();
     let matches = match (&current, desired) {
-        (Some(value), true) => value.trim_matches('"') == exe,
+        (Some(value), true) => same_exe(&registered_exe(value), &exe),
         (Some(_), false) => false,
         (None, true) => false,
         (None, false) => true,
@@ -123,5 +130,60 @@ pub fn reconcile(desired: bool) {
     }
     if let Err(err) = set_enabled(desired, &exe) {
         eprintln!("codexbar: autostart could not be updated: {err}");
+    }
+}
+
+/// Executable part of a Run value: the quoted path, or everything up to the
+/// first space when unquoted. `"C:\a b\x.exe" --widget` → `C:\a b\x.exe`.
+pub fn registered_exe(value: &str) -> String {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("").to_string();
+    }
+    // Unquoted: the whole value when it is an existing-looking path with
+    // spaces and no switches, otherwise the first token.
+    match value.find(" -") {
+        Some(i) => value[..i].trim_end().to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// Windows paths are case-insensitive.
+fn same_exe(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_exe_handles_quotes_and_arguments() {
+        assert_eq!(
+            registered_exe(r#""C:\Program Files\CodexBar\codexbar-win.exe""#),
+            r"C:\Program Files\CodexBar\codexbar-win.exe"
+        );
+        assert_eq!(
+            registered_exe(r#""C:\Apps\codexbar-win.exe" --widget"#),
+            r"C:\Apps\codexbar-win.exe"
+        );
+        assert_eq!(
+            registered_exe(r"C:\Apps\codexbar-win.exe --widget"),
+            r"C:\Apps\codexbar-win.exe"
+        );
+        assert_eq!(
+            registered_exe(r"C:\My Apps\codexbar-win.exe"),
+            r"C:\My Apps\codexbar-win.exe"
+        );
+        assert_eq!(registered_exe(""), "");
+    }
+
+    #[test]
+    fn exe_comparison_ignores_case() {
+        assert!(same_exe(
+            r"C:\Apps\CodexBar-Win.exe",
+            r"c:\apps\codexbar-win.exe"
+        ));
+        assert!(!same_exe(r"C:\Apps\a.exe", r"C:\Apps\b.exe"));
     }
 }
